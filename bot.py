@@ -3,6 +3,7 @@ import logging
 import asyncio
 import tempfile
 import shutil
+import threading
 from pathlib import Path
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -12,9 +13,9 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton, 
-    Message,
-    CallbackQuery
+    Message
 )
+from flask import Flask
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +39,24 @@ sessions = {}
 PAGE_WIDTH, PAGE_HEIGHT = A4
 TEMP_DIR = Path("user_data")
 TEMP_DIR.mkdir(exist_ok=True)
+
+# Create Flask app for web server
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "📸 Telegram PDF Bot is Running!"
+
+@flask_app.route('/health')
+def health_check():
+    return "OK", 200
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=8000)
+
+# Start Flask in a separate thread
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
 
 # Create Pyrogram client with optimized settings
 app = Client(
@@ -72,9 +91,9 @@ async def download_image(message: Message, path: Path) -> Path:
     await message.download(file_name=str(file_path))
     return file_path
 
-def generate_high_quality_pdf(images: list, output_path: str) -> int:
-    """Generate PDF with full-width images maintaining quality"""
-    c = canvas.Canvas(output_path, pagesize=A4)
+def generate_hq_pdf(images: list, output_path: str) -> int:
+    """Generate high-quality PDF with full-width images"""
+    c = canvas.Canvas(output_path, pagesize=A4, pageCompression=0)
     page_count = 0
     current_y = PAGE_HEIGHT
     
@@ -89,15 +108,14 @@ def generate_high_quality_pdf(images: list, output_path: str) -> int:
                 
                 # Check if image fits on current page
                 if scaled_height > current_y:
-                    # Start new page
                     c.showPage()
                     page_count += 1
                     current_y = PAGE_HEIGHT
                 
-                # Draw image at full width
+                # Draw image at full width with original quality
                 c.drawImage(
-                    ImageReader(img),  # Preserve original quality
-                    0,                 # X position (full width)
+                    ImageReader(img),   # Preserve original quality
+                    0,                  # X position (full width)
                     current_y - scaled_height,  # Y position
                     width=scaled_width,
                     height=scaled_height,
@@ -111,8 +129,24 @@ def generate_high_quality_pdf(images: list, output_path: str) -> int:
         except Exception as e:
             logger.error(f"Error processing {img_path}: {e}")
     
+    # Save the last page
+    if current_y < PAGE_HEIGHT:
+        page_count += 1
     c.save()
-    return page_count + 1  # +1 for the last page
+    return page_count
+
+@app.on_message(filters.command("start"))
+async def start_command(client: Client, message: Message):
+    """Send welcome message"""
+    await message.reply(
+        "🖼️ **Image to PDF Converter**\n\n"
+        "1. Send /begin to start a session\n"
+        "2. Send your images (photos or documents)\n"
+        "3. Send /stop when done\n"
+        "4. Name your PDF file\n\n"
+        "I'll create a high-quality PDF with your images at full width!",
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
 
 @app.on_message(filters.command("begin"))
 async def start_session(client: Client, message: Message):
@@ -133,10 +167,10 @@ async def start_session(client: Client, message: Message):
     }
     
     await message.reply(
-        "📸 <b>Session started!</b>\n"
+        "📸 **Session started!**\n"
         "Send me images now. When done, send /stop\n\n"
-        "<i>I'll maintain the order of your images in the PDF.</i>",
-        parse_mode=enums.ParseMode.HTML
+        "_I'll maintain the order of your images in the PDF._",
+        parse_mode=enums.ParseMode.MARKDOWN
     )
 
 @app.on_message(filters.command("stop"))
@@ -155,24 +189,71 @@ async def stop_session(client: Client, message: Message):
         clean_session(user_id)
         return
     
-    # Ask for PDF filename
-    await message.reply(
-        f"🛑 <b>Session stopped!</b>\n"
-        f"• Images received: {count}\n\n"
-        "Please send a name for your PDF file:",
-        parse_mode=enums.ParseMode.HTML
-    )
+    # Create confirmation buttons
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Cancel Session", callback_data="cancel")],
+        [InlineKeyboardButton("📤 Generate PDF", callback_data="generate")]
+    ])
     
-    # Set state to wait for filename
-    sessions[user_id]["waiting_for_name"] = True
+    await message.reply(
+        f"🛑 **Session stopped!**\n"
+        f"• Images received: `{count}`\n\n"
+        "Press **Generate PDF** to create your document\n"
+        "or **Cancel Session** to start over.",
+        reply_markup=keyboard,
+        parse_mode=enums.ParseMode.MARKDOWN
+    )
 
-@app.on_message(filters.command("cancel"))
-async def cancel_session(client: Client, message: Message):
-    """Cancel current session"""
-    user_id = message.from_user.id
+@app.on_callback_query(filters.regex("generate"))
+async def handle_generate(client, callback_query):
+    """Handle PDF generation request"""
+    user_id = callback_query.from_user.id
+    if user_id not in sessions:
+        await callback_query.answer("Session expired!", show_alert=True)
+        return
+    
+    await callback_query.answer("Creating your PDF...")
+    await callback_query.message.edit("🔄 **Creating high-quality PDF...**")
+    
+    try:
+        # Generate PDF
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            pdf_path = tmp.name
+        
+        images = sessions[user_id]["images"]
+        page_count = generate_hq_pdf(images, pdf_path)
+        
+        # Send PDF with custom filename
+        await client.send_document(
+            chat_id=user_id,
+            document=pdf_path,
+            file_name="Your_Document.pdf",
+            caption=(
+                f"✅ **PDF Generated!**\n"
+                f"• Images: `{len(images)}`\n"
+                f"• Pages: `{page_count}`\n"
+                f"• Quality: High (Original Resolution)"
+            ),
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+        
+        # Cleanup
+        os.unlink(pdf_path)
+        clean_session(user_id)
+        
+    except Exception as e:
+        logger.error(f"PDF error: {e}")
+        await callback_query.message.edit("❌ Failed to generate PDF. Please try /begin again.")
+        clean_session(user_id)
+
+@app.on_callback_query(filters.regex("cancel"))
+async def handle_cancel(client, callback_query):
+    """Handle session cancellation"""
+    user_id = callback_query.from_user.id
     if user_id in sessions:
         clean_session(user_id)
-    await message.reply("❌ Session canceled!")
+    await callback_query.answer("Session canceled!", show_alert=True)
+    await callback_query.message.edit("❌ Session canceled!")
 
 @app.on_message(filters.private & (filters.photo | filters.document))
 async def handle_image(client: Client, message: Message):
@@ -194,61 +275,11 @@ async def handle_image(client: Client, message: Message):
         # Send quick confirmation
         count = len(sessions[user_id]["images"])
         if count % 5 == 0:  # Update every 5 images
-            await message.reply(f"✅ Added {count} images so far...")
+            await message.reply(f"✅ Added `{count}` images so far...",
+                               parse_mode=enums.ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Image error: {e}")
         await message.reply("❌ Failed to process image. Please try again.")
-
-@app.on_message(filters.private & filters.text)
-async def handle_filename(client: Client, message: Message):
-    """Handle PDF filename input"""
-    user_id = message.from_user.id
-    if user_id not in sessions:
-        return
-    if not sessions[user_id].get("waiting_for_name"):
-        return
-    
-    # Clean filename
-    filename = message.text.strip()
-    if not filename:
-        await message.reply("⚠️ Please send a valid filename!")
-        return
-    if len(filename) > 50:
-        filename = filename[:50]
-    
-    # Generate PDF
-    try:
-        await message.reply("🔄 <b>Creating high-quality PDF...</b>", 
-                           parse_mode=enums.ParseMode.HTML)
-        
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            pdf_path = tmp.name
-        
-        images = sessions[user_id]["images"]
-        page_count = generate_high_quality_pdf(images, pdf_path)
-        
-        # Send PDF with custom filename
-        await client.send_document(
-            chat_id=user_id,
-            document=pdf_path,
-            file_name=f"{filename}.pdf",
-            caption=(
-                f"✅ <b>PDF Generated!</b>\n"
-                f"• Images: {len(images)}\n"
-                f"• Pages: {page_count}\n"
-                f"• Quality: High (Original Resolution)"
-            ),
-            parse_mode=enums.ParseMode.HTML
-        )
-        
-        # Cleanup
-        os.unlink(pdf_path)
-        clean_session(user_id)
-        
-    except Exception as e:
-        logger.error(f"PDF error: {e}")
-        await message.reply("❌ Failed to generate PDF. Please try /begin again.")
-        clean_session(user_id)
 
 def clean_session(user_id):
     """Clean up user session"""
@@ -259,5 +290,5 @@ def clean_session(user_id):
         del sessions[user_id]
 
 if __name__ == "__main__":
-    logger.info("Starting PDF Converter Bot...")
+    logger.info("Starting PDF Converter Bot with Flask server...")
     app.run()
