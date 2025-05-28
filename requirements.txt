@@ -1,0 +1,5 @@
+pyrofork
+Pillow
+reportlab
+Flask
+python-dotenv
