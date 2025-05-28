@@ -1,8 +1,9 @@
 import os
 import logging
 import threading
+import time
 from pathlib import Path
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from PIL import Image
 from reportlab.lib.pagesizes import A4
@@ -10,6 +11,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 import tempfile
 import shutil
+import asyncio
 from flask import Flask
 
 # Configure logging
@@ -35,6 +37,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 # User session data
 user_sessions = {}
+session_lock = asyncio.Lock()  # Lock for session operations
 
 # Create Flask app for web server
 flask_app = Flask(__name__)
@@ -54,7 +57,16 @@ def run_flask():
 flask_thread = threading.Thread(target=run_flask, daemon=True)
 flask_thread.start()
 
-app = Client("pdf_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Pyrogram client with improved connection settings
+app = Client(
+    "pdf_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=100,
+    sleep_threshold=60,
+    in_memory=True
+)
 
 def is_valid_image(message: Message) -> bool:
     """Check if message contains a valid image"""
@@ -63,9 +75,24 @@ def is_valid_image(message: Message) -> bool:
     if message.document:
         file_name = (message.document.file_name or "").lower()
         mime_type = (message.document.mime_type or "").lower()
-        return (file_name.endswith(('.png', '.jpg', '.jpeg')) or 
-                'image' in mime_type)
+        return (file_name.endswith(('.png', '.jpg', '.jpeg', '.webp')) or \
+               ('image' in mime_type)
     return False
+
+async def download_image(message: Message, user_dir: Path) -> str:
+    """Download image from message and return file path"""
+    if message.photo:
+        file_id = message.photo.file_id
+        ext = ".jpg"
+    else:
+        file_id = message.document.file_id
+        ext = Path(message.document.file_name).suffix.lower()
+        if not ext or ext not in (".png", ".jpg", ".jpeg", ".webp"):
+            ext = ".jpg"
+    
+    file_path = user_dir / f"{file_id}{ext}"
+    await message.download(file_name=str(file_path))
+    return str(file_path)
 
 def generate_pdf(image_paths, output_path):
     """Generate PDF from images with dynamic layout"""
@@ -79,36 +106,41 @@ def generate_pdf(image_paths, output_path):
     page_count = 1
     
     for image_path in image_paths:
-        with Image.open(image_path) as img:
-            img_width, img_height = img.size
-            aspect_ratio = img_height / img_width
-            
-            # Calculate scaled dimensions
-            scaled_width = min(usable_width, img_width)
-            scaled_height = scaled_width * aspect_ratio
-            
-            # Check if image fits in remaining space
-            if scaled_height > (current_y - margin):
-                # Start new page
-                c.showPage()
-                current_y = page_height - margin
-                page_count += 1
-            
-            # Center image horizontally
-            x_pos = margin + (usable_width - scaled_width) / 2
-            
-            # Draw image
-            c.drawImage(
-                image_path,
-                x_pos,
-                current_y - scaled_height,
-                width=scaled_width,
-                height=scaled_height,
-                preserveAspectRatio=True
-            )
-            
-            # Update vertical position
-            current_y -= scaled_height
+        try:
+            with Image.open(image_path) as img:
+                img_width, img_height = img.size
+                aspect_ratio = img_height / img_width
+                
+                # Calculate scaled dimensions
+                scaled_width = min(usable_width, img_width)
+                scaled_height = scaled_width * aspect_ratio
+                
+                # Check if image fits in remaining space
+                if scaled_height > (current_y - margin):
+                    # Start new page
+                    c.showPage()
+                    current_y = page_height - margin
+                    page_count += 1
+                
+                # Center image horizontally
+                x_pos = margin + (usable_width - scaled_width) / 2
+                
+                # Draw image
+                c.drawImage(
+                    image_path,
+                    x_pos,
+                    current_y - scaled_height,
+                    width=scaled_width,
+                    height=scaled_height,
+                    preserveAspectRatio=True,
+                    mask='auto'
+                )
+                
+                # Update vertical position
+                current_y -= scaled_height
+        except Exception as e:
+            logger.error(f"Error processing image {image_path}: {e}")
+            continue
     
     c.save()
     return page_count
@@ -117,15 +149,43 @@ def clean_user_data(user_id):
     """Remove user's temporary files"""
     user_dir = TEMP_DIR / str(user_id)
     if user_dir.exists():
-        shutil.rmtree(user_dir)
+        shutil.rmtree(user_dir, ignore_errors=True)
     if user_id in user_sessions:
         del user_sessions[user_id]
 
-@app.on_message(filters.private & (filters.photo | filters.document))
+async def update_session_message(user_id, client: Client, text):
+    """Update or create session status message"""
+    try:
+        if user_id in user_sessions and user_sessions[user_id].get("message_id"):
+            await client.edit_message_text(
+                chat_id=user_id,
+                message_id=user_sessions[user_id]["message_id"],
+                text=text,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📦 Generate PDF", callback_data="generate")],
+                    [InlineKeyboardButton("🔄 Reset Session", callback_data="reset")]
+                ])
+            )
+        else:
+            async with session_lock:
+                if user_id in user_sessions:
+                    new_msg = await client.send_message(
+                        chat_id=user_id,
+                        text=text,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("📦 Generate PDF", callback_data="generate")],
+                            [InlineKeyboardButton("🔄 Reset Session", callback_data="reset")]
+                        ])
+                    )
+                    user_sessions[user_id]["message_id"] = new_msg.id
+    except Exception as e:
+        logger.error(f"Error updating session message: {e}")
+
+@app.on_message(filters.private & (filters.photo | filters.document | filters.media_group))
 async def handle_image(client: Client, message: Message):
-    """Handle incoming images"""
-    # Validate image type
-    if not is_valid_image(message):
+    """Handle incoming images and media groups"""
+    # Skip if not valid image and not media group
+    if not is_valid_image(message) and not message.media_group_id:
         return
     
     user_id = message.from_user.id
@@ -133,64 +193,80 @@ async def handle_image(client: Client, message: Message):
     user_dir.mkdir(exist_ok=True)
     
     # Initialize session
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            "images": [],
-            "message_id": None,
-            "processing": False
-        }
+    async with session_lock:
+        if user_id not in user_sessions:
+            user_sessions[user_id] = {
+                "images": [],
+                "message_id": None,
+                "processing": False,
+                "media_groups": set()
+            }
     
     # Skip if already processing
-    if user_sessions[user_id]["processing"]:
+    if user_sessions[user_id].get("processing"):
         return
     
+    # Handle media groups (albums)
+    if message.media_group_id:
+        group_id = message.media_group_id
+        
+        # Skip if we're already processing this media group
+        if group_id in user_sessions[user_id]["media_groups"]:
+            return
+        
+        # Mark this group as being processed
+        user_sessions[user_id]["media_groups"].add(group_id)
+        
+        try:
+            # Get all messages in the media group
+            await asyncio.sleep(1)  # Wait for all group messages to arrive
+            group_messages = await client.get_media_group(
+                chat_id=message.chat.id,
+                message_id=message.id
+            )
+            
+            added_count = 0
+            for msg in group_messages:
+                if is_valid_image(msg):
+                    try:
+                        file_path = await download_image(msg, user_dir)
+                        user_sessions[user_id]["images"].append(file_path)
+                        added_count += 1
+                    except Exception as e:
+                        logger.error(f"Error downloading media group image: {e}")
+            
+            if added_count > 0:
+                count = len(user_sessions[user_id]["images"])
+                await update_session_message(
+                    user_id,
+                    client,
+                    f"✅ Added {added_count} images from album! Total images: {count}\n"
+                    "Press 'Generate PDF' when ready or add more images."
+                )
+            else:
+                await message.reply_text("❌ No valid images found in the album.")
+        
+        except Exception as e:
+            logger.error(f"Error processing media group: {e}")
+            await message.reply_text("❌ Failed to process image album. Please try again.")
+        finally:
+            # Remove group from processing set
+            if user_id in user_sessions:
+                user_sessions[user_id]["media_groups"].discard(group_id)
+        return
+    
+    # Handle single image
     try:
-        # Download image
-        if message.photo:
-            file_id = message.photo.file_id
-            ext = ".jpg"
-        else:
-            file_id = message.document.file_id
-            ext = Path(message.document.file_name).suffix.lower() or ".jpg"
-        
-        file_path = user_dir / f"{file_id}{ext}"
-        await message.download(file_name=str(file_path))
-        
-        # Add to user's image list
-        user_sessions[user_id]["images"].append(str(file_path))
+        file_path = await download_image(message, user_dir)
+        user_sessions[user_id]["images"].append(file_path)
         count = len(user_sessions[user_id]["images"])
         
-        # Prepare response keyboard
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📦 Generate PDF", callback_data="generate")],
-            [InlineKeyboardButton("🔄 Reset Session", callback_data="reset")]
-        ])
-        
-        # Create or update status message
-        if user_sessions[user_id]["message_id"]:
-            try:
-                await client.edit_message_text(
-                    chat_id=user_id,
-                    message_id=user_sessions[user_id]["message_id"],
-                    text=f"✅ Images received: {count}\n"
-                         "Press 'Generate PDF' when ready or add more images.",
-                    reply_markup=keyboard
-                )
-            except:
-                # Fallback if message editing fails
-                new_msg = await message.reply_text(
-                    f"✅ Image added! Total images: {count}\n"
-                    "Press 'Generate PDF' when ready or add more images.",
-                    reply_markup=keyboard
-                )
-                user_sessions[user_id]["message_id"] = new_msg.id
-        else:
-            new_msg = await message.reply_text(
-                f"✅ First image received! Total images: {count}\n"
-                "Press 'Generate PDF' when ready or add more images.",
-                reply_markup=keyboard
-            )
-            user_sessions[user_id]["message_id"] = new_msg.id
+        await update_session_message(
+            user_id,
+            client,
+            f"✅ Image added! Total images: {count}\n"
+            "Press 'Generate PDF' when ready or add more images."
+        )
     
     except Exception as e:
         logger.error(f"Error handling image: {e}")
@@ -200,14 +276,13 @@ async def handle_image(client: Client, message: Message):
 async def handle_callback(client, callback_query):
     """Handle button clicks"""
     user_id = callback_query.from_user.id
-    data = callback_query.data
     
     if user_id not in user_sessions:
         await callback_query.answer("Session expired! Please start over.", show_alert=True)
         return
     
     try:
-        if data == "generate":
+        if callback_query.data == "generate":
             # Check if there are images
             if not user_sessions[user_id]["images"]:
                 await callback_query.answer("No images to process!", show_alert=True)
@@ -218,14 +293,11 @@ async def handle_callback(client, callback_query):
             await callback_query.answer("Generating PDF...")
             
             # Update status message
-            try:
-                await client.edit_message_text(
-                    chat_id=user_id,
-                    message_id=user_sessions[user_id]["message_id"],
-                    text="⏳ Generating PDF... Please wait"
-                )
-            except:
-                pass
+            await client.edit_message_text(
+                chat_id=user_id,
+                message_id=user_sessions[user_id]["message_id"],
+                text="⏳ Generating PDF... Please wait"
+            )
             
             # Generate PDF
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -240,14 +312,15 @@ async def handle_callback(client, callback_query):
                 document=pdf_path,
                 caption=f"✅ PDF Generated!\n"
                         f"• Images processed: {image_count}\n"
-                        f"• Pages created: {page_count}"
+                        f"• Pages created: {page_count}",
+                file_name="converted_images.pdf"
             )
             
             # Clean up
             os.unlink(pdf_path)
             clean_user_data(user_id)
             
-        elif data == "reset":
+        elif callback_query.data == "reset":
             clean_user_data(user_id)
             await callback_query.answer("Session reset! You can start over.", show_alert=True)
     
@@ -259,6 +332,20 @@ async def handle_callback(client, callback_query):
         if user_id in user_sessions:
             user_sessions[user_id]["processing"] = False
 
+def run_bot():
+    """Run the bot with restart capabilities"""
+    while True:
+        try:
+            logger.info("Starting Telegram bot...")
+            app.run()
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"Bot crashed: {str(e)}")
+            logger.info("Restarting bot in 5 seconds...")
+            time.sleep(5)
+
 if __name__ == "__main__":
     logger.info("Starting bot and web server...")
-    app.run()
+    run_bot()
