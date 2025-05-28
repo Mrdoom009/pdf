@@ -75,7 +75,7 @@ def is_valid_image(message: Message) -> bool:
     if message.document:
         file_name = (message.document.file_name or "").lower()
         mime_type = (message.document.mime_type or "").lower()
-        return (file_name.endswith(('.png', '.jpg', '.jpeg', '.webp')) or \
+        return (file_name.endswith(('.png', '.jpg', '.jpeg', '.webp'))) or \
                ('image' in mime_type)
     return False
 
