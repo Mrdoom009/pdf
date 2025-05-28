@@ -85,7 +85,8 @@ def clean_user_data(user_id):
     if user_id in user_sessions:
         del user_sessions[user_id]
 
-@app.on_message(filters.photo | (filters.document & filters.mime_type("image")))
+# FIX: Updated image filter for Pyrofork compatibility
+@app.on_message(filters.photo | (filters.document & filters.regex(r'\.(jpg|jpeg|png)$')))
 async def handle_image(client: Client, message: Message):
     """Handle incoming images"""
     user_id = message.from_user.id
