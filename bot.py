@@ -108,7 +108,7 @@ async def download_image(message: Message, path: Path) -> Path:
     
     raise Exception("Failed to download image after 3 attempts")
 
-def generate_hq_pdf(images: list, output_path: str) -> int:
+def generate_hq_pdf(images: list, output_path: str, progress_callback=None) -> int:
     """
     Generate high-quality PDF with 3 images per page
     - Images maintain original aspect ratio
@@ -124,7 +124,8 @@ def generate_hq_pdf(images: list, output_path: str) -> int:
     image_height = usable_height / IMAGES_PER_PAGE
     
     # Process images in batches of IMAGES_PER_PAGE
-    for i in range(0, len(images), IMAGES_PER_PAGE):
+    total_images = len(images)
+    for i in range(0, total_images, IMAGES_PER_PAGE):
         page_count += 1
         c.showPage()
         current_y = PAGE_HEIGHT
@@ -170,6 +171,11 @@ def generate_hq_pdf(images: list, output_path: str) -> int:
                     
             except Exception as e:
                 logger.error(f"Error processing {img_path}: {e}")
+        
+        # Update progress after each page
+        if progress_callback:
+            processed = min(i + IMAGES_PER_PAGE, total_images)
+            progress_callback(processed, total_images)
     
     c.save()
     return page_count
@@ -287,16 +293,34 @@ async def handle_text(client: Client, message: Message):
         if len(filename) > 50:
             filename = filename[:50]
         
-        # Generate PDF
+        # Generate PDF with progress
         try:
-            await message.reply("🔄 Creating your PDF...")
+            # Create progress message
+            pdf_progress_msg = await message.reply("🔄 Creating your PDF... 0%")
+            
+            # Progress callback function
+            def pdf_progress_callback(processed, total):
+                percent = int((processed / total) * 100)
+                asyncio.run_coroutine_threadsafe(
+                    pdf_progress_msg.edit_text(f"🔄 Creating your PDF... {percent}%"),
+                    app.loop
+                )
             
             # Create PDF
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                 pdf_path = tmp.name
             
             images = sessions[user_id]["downloaded_images"]
-            page_count = generate_hq_pdf(images, pdf_path)
+            
+            # Create PDF with progress updates
+            page_count = generate_hq_pdf(
+                images, 
+                pdf_path,
+                progress_callback=pdf_progress_callback
+            )
+            
+            # Final progress update
+            await pdf_progress_msg.edit_text("✅ PDF created! Sending now...")
             
             # Send PDF with custom filename
             await client.send_document(
@@ -354,10 +378,9 @@ async def handle_image(client: Client, message: Message):
                         "type": "photo" if msg.photo else "document"
                     })
             
-            # Update user on progress
+            # Only confirm album addition
             count = len(sessions[user_id]["image_refs"])
-            await message.reply(f"✅ Added {len(media_group)} images from album. Total: `{count}`",
-                               parse_mode=enums.ParseMode.MARKDOWN)
+            await message.reply(f"✅ Added {len(media_group)} images from album")
         except Exception as e:
             logger.error(f"Media group error: {e}")
             await message.reply("❌ Failed to process image album. Please try again.")
@@ -377,11 +400,7 @@ async def handle_image(client: Client, message: Message):
             "type": "photo" if message.photo else "document"
         })
         
-        # Send quick confirmation
-        count = len(sessions[user_id]["image_refs"])
-        if count % 5 == 0:  # Update every 5 images
-            await message.reply(f"✅ Added `{count}` images so far...",
-                               parse_mode=enums.ParseMode.MARKDOWN)
+        # No "added so far" message for single images
     except Exception as e:
         logger.error(f"Image error: {e}")
         await message.reply("❌ Failed to process image. Please try again.")
