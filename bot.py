@@ -44,6 +44,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 # PDF layout configuration
 IMAGES_PER_PAGE = 3
 VERTICAL_SPACING = 20  # Points between images
+TARGET_DPI = 150       # Balance quality and file size
 
 # Create Flask app for web server
 flask_app = Flask(__name__)
@@ -108,6 +109,21 @@ async def download_image(message: Message, path: Path) -> Path:
     
     raise Exception("Failed to download image after 3 attempts")
 
+def optimize_image_size(img_path: Path):
+    """Resize image to target DPI for PDF optimization"""
+    try:
+        with Image.open(img_path) as img:
+            # Calculate max dimensions for A4 at target DPI
+            max_width = int((PAGE_WIDTH / 72) * TARGET_DPI)
+            max_height = int((PAGE_HEIGHT / 72) * TARGET_DPI)
+            
+            # Only resize if image is larger than target
+            if img.width > max_width or img.height > max_height:
+                img.thumbnail((max_width, max_height), Image.LANCZOS)
+                img.save(img_path, quality=90, optimize=True)
+    except Exception as e:
+        logger.error(f"Image optimization error: {e}")
+
 def generate_hq_pdf(images: list, output_path: str, progress_callback=None) -> int:
     """
     Generate high-quality PDF with 3 images per page
@@ -116,40 +132,56 @@ def generate_hq_pdf(images: list, output_path: str, progress_callback=None) -> i
     - Vertical spacing between images
     - Page height adjusts to fit 3 images
     """
-    c = canvas.Canvas(output_path, pagesize=A4, pageCompression=0)
+    c = canvas.Canvas(output_path, pagesize=A4)
+    c.setPageCompression(1)  # Enable compression
     page_count = 0
-    
-    # Calculate layout dimensions
-    usable_height = PAGE_HEIGHT - (VERTICAL_SPACING * (IMAGES_PER_PAGE - 1))
-    image_height = usable_height / IMAGES_PER_PAGE
+    total_images = len(images)
     
     # Process images in batches of IMAGES_PER_PAGE
-    total_images = len(images)
     for i in range(0, total_images, IMAGES_PER_PAGE):
+        # Start a new page only if not the first page
+        if page_count > 0:
+            c.showPage()
         page_count += 1
-        c.showPage()
-        current_y = PAGE_HEIGHT
         
-        # Process each image in this page
-        for img_path in images[i:i+IMAGES_PER_PAGE]:
+        current_y = PAGE_HEIGHT
+        batch = images[i:i+IMAGES_PER_PAGE]
+        
+        # Calculate total height needed for this batch
+        total_height = 0
+        aspect_ratios = []
+        
+        for img_path in batch:
+            try:
+                if img_path.exists():
+                    with Image.open(img_path) as img:
+                        aspect_ratios.append(img.height / img.width)
+            except:
+                aspect_ratios.append(1.0)  # Default aspect ratio
+        
+        # Calculate available height per image
+        available_height = PAGE_HEIGHT - (VERTICAL_SPACING * (len(batch) - 1))
+        height_per_image = available_height / len(batch)
+        
+        # Draw each image in this page
+        for idx, img_path in enumerate(batch):
             try:
                 # Verify image exists
                 if not img_path.exists():
                     logger.warning(f"Skipping missing file: {img_path}")
                     continue
-                    
+                
                 with Image.open(img_path) as img:
-                    # Calculate dimensions while maintaining aspect ratio
-                    img_width, img_height = img.size
-                    aspect = img_height / img_width
+                    # Get aspect ratio
+                    aspect = aspect_ratios[idx]
                     
                     # Calculate scaled dimensions
                     scaled_width = PAGE_WIDTH
                     scaled_height = scaled_width * aspect
                     
-                    # Adjust if too tall for allocated space
-                    if scaled_height > image_height:
-                        scaled_height = image_height
+                    # Adjust height to fit allocated space
+                    if scaled_height > height_per_image:
+                        scaled_height = height_per_image
                         scaled_width = scaled_height / aspect
                     
                     # Center horizontally
@@ -192,7 +224,7 @@ async def start_command(client: Client, message: Message):
         "Features:\n"
         "- 3 images per page with proper spacing\n"
         "- Full-width images\n"
-        "- Original image quality\n"
+        "- Optimized PDF size with good quality\n"
         "- Custom PDF filename",
         parse_mode=enums.ParseMode.MARKDOWN
     )
@@ -210,7 +242,7 @@ async def start_session(client: Client, message: Message):
     
     # Initialize session
     sessions[user_id] = {
-        "image_refs": [],  # Store message references instead of downloading immediately
+        "image_refs": [],  # Store message references
         "active": True,
         "dir": user_dir,
         "media_groups": set()
@@ -252,6 +284,10 @@ async def stop_session(client: Client, message: Message):
             
             # Download image
             img_path = await download_image(img_ref["message"], sessions[user_id]["dir"])
+            
+            # Optimize image size for PDF
+            optimize_image_size(img_path)
+            
             sessions[user_id]["downloaded_images"].append(img_path)
             
         except Exception as e:
@@ -331,7 +367,7 @@ async def handle_text(client: Client, message: Message):
                     f"✅ **PDF Generated!**\n"
                     f"• Images: `{len(images)}`\n"
                     f"• Pages: `{page_count}`\n"
-                    f"• Layout: 3 images per page with spacing"
+                    f"• Layout: Up to 3 images per page with spacing"
                 ),
                 parse_mode=enums.ParseMode.MARKDOWN
             )
@@ -377,13 +413,8 @@ async def handle_image(client: Client, message: Message):
                         "message": msg,
                         "type": "photo" if msg.photo else "document"
                     })
-            
-            # Only confirm album addition
-            count = len(sessions[user_id]["image_refs"])
-            await message.reply(f"✅ Added {len(media_group)} images from album")
         except Exception as e:
             logger.error(f"Media group error: {e}")
-            await message.reply("❌ Failed to process image album. Please try again.")
         finally:
             # Remove group from processing set
             sessions[user_id]["media_groups"].discard(group_id)
@@ -399,11 +430,8 @@ async def handle_image(client: Client, message: Message):
             "message": message,
             "type": "photo" if message.photo else "document"
         })
-        
-        # No "added so far" message for single images
     except Exception as e:
         logger.error(f"Image error: {e}")
-        await message.reply("❌ Failed to process image. Please try again.")
 
 def clean_session(user_id):
     """Clean up user session"""
