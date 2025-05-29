@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import shutil
 import threading
+import time
 from pathlib import Path
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -65,7 +66,7 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workers=100,
-    sleep_threshold=60,
+    sleep_threshold=120,  # Increased sleep threshold
     in_memory=True
 )
 
@@ -79,17 +80,30 @@ def is_image(message: Message) -> bool:
     return False
 
 async def download_image(message: Message, path: Path) -> Path:
-    """Download image with original quality"""
+    """Download image with original quality and ensure completion"""
     if message.photo:
+        # For photos, use the largest available size
         file_id = message.photo.file_id
         ext = ".jpg"
     else:
         file_id = message.document.file_id
         ext = Path(message.document.file_name or "image").suffix or ".jpg"
     
-    file_path = path / f"{file_id}{ext}"
-    await message.download(file_name=str(file_path))
-    return file_path
+    # Create a unique filename
+    file_path = path / f"{int(time.time())}_{file_id}{ext}"
+    
+    # Download with retry mechanism
+    for attempt in range(3):
+        try:
+            await message.download(file_name=str(file_path))
+            # Verify file exists and has content
+            if file_path.exists() and file_path.stat().st_size > 0:
+                return file_path
+        except Exception as e:
+            logger.warning(f"Download attempt {attempt+1} failed: {e}")
+            await asyncio.sleep(1)
+    
+    raise Exception("Failed to download image after 3 attempts")
 
 def generate_hq_pdf(images: list, output_path: str) -> int:
     """Generate high-quality PDF with full-width images"""
@@ -99,6 +113,11 @@ def generate_hq_pdf(images: list, output_path: str) -> int:
     
     for img_path in images:
         try:
+            # Verify image exists before processing
+            if not img_path.exists():
+                logger.warning(f"Skipping missing file: {img_path}")
+                continue
+                
             with Image.open(img_path) as img:
                 # Calculate dimensions while maintaining aspect ratio
                 img_width, img_height = img.size
@@ -143,7 +162,7 @@ async def start_command(client: Client, message: Message):
         "1. Send /begin to start a session\n"
         "2. Send your images (photos or documents)\n"
         "3. Send /stop when done\n"
-        "4. Name your PDF file\n\n"
+        "4. Press 'Generate PDF' button\n\n"
         "I'll create a high-quality PDF with your images at full width!",
         parse_mode=enums.ParseMode.MARKDOWN
     )
@@ -157,13 +176,14 @@ async def start_session(client: Client, message: Message):
     # Clean previous session
     if user_dir.exists():
         shutil.rmtree(user_dir, ignore_errors=True)
-    user_dir.mkdir()
+    user_dir.mkdir(parents=True, exist_ok=True)
     
     # Initialize session
     sessions[user_id] = {
         "images": [],
         "active": True,
-        "dir": user_dir
+        "dir": user_dir,
+        "media_groups": set()  # Track processed media groups
     }
     
     await message.reply(
@@ -255,14 +275,54 @@ async def handle_cancel(client, callback_query):
     await callback_query.answer("Session canceled!", show_alert=True)
     await callback_query.message.edit("❌ Session canceled!")
 
-@app.on_message(filters.private & (filters.photo | filters.document))
+@app.on_message(filters.private & (filters.photo | filters.document | filters.media_group))
 async def handle_image(client: Client, message: Message):
-    """Handle incoming images"""
+    """Handle incoming images and media groups"""
     user_id = message.from_user.id
     
-    # Validate session and image
+    # Validate session
     if user_id not in sessions or not sessions[user_id]["active"]:
         return
+    
+    # Handle media groups (albums)
+    if message.media_group_id:
+        group_id = message.media_group_id
+        
+        # Skip if we've already processed this group
+        if group_id in sessions[user_id]["media_groups"]:
+            return
+        
+        # Mark this media group as being processed
+        sessions[user_id]["media_groups"].add(group_id)
+        
+        try:
+            # Wait a bit for all parts of the media group to arrive
+            await asyncio.sleep(2)
+            media_group = await client.get_media_group(user_id, message.id)
+            
+            # Download each image in the group
+            for msg in media_group:
+                if is_image(msg):
+                    try:
+                        user_dir = sessions[user_id]["dir"]
+                        img_path = await download_image(msg, user_dir)
+                        sessions[user_id]["images"].append(img_path)
+                    except Exception as e:
+                        logger.error(f"Error downloading image from media group: {e}")
+            
+            # Update user on progress
+            count = len(sessions[user_id]["images"])
+            await message.reply(f"✅ Added {len(media_group)} images from album. Total: `{count}`",
+                               parse_mode=enums.ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.error(f"Media group error: {e}")
+            await message.reply("❌ Failed to process image album. Please try again.")
+        finally:
+            # Remove group from processing set
+            sessions[user_id]["media_groups"].discard(group_id)
+        return
+    
+    # Handle single image
     if not is_image(message):
         return
     
@@ -289,6 +349,17 @@ def clean_session(user_id):
             shutil.rmtree(user_dir, ignore_errors=True)
         del sessions[user_id]
 
+def run_bot():
+    """Run the bot with restart capabilities"""
+    while True:
+        try:
+            logger.info("Starting Telegram bot...")
+            app.run()
+        except Exception as e:
+            logger.error(f"Bot crashed: {e}")
+            logger.info("Restarting bot in 5 seconds...")
+            time.sleep(5)
+
 if __name__ == "__main__":
     logger.info("Starting PDF Converter Bot with Flask server...")
-    app.run()
+    run_bot()
