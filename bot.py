@@ -4,7 +4,7 @@ import asyncio
 import tempfile
 import shutil
 import threading
-import time
+import math
 from pathlib import Path
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -41,6 +41,10 @@ PAGE_WIDTH, PAGE_HEIGHT = A4
 TEMP_DIR = Path("user_data")
 TEMP_DIR.mkdir(exist_ok=True)
 
+# PDF layout configuration
+IMAGES_PER_PAGE = 3
+VERTICAL_SPACING = 20  # Points between images
+
 # Create Flask app for web server
 flask_app = Flask(__name__)
 
@@ -66,7 +70,7 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     workers=100,
-    sleep_threshold=120,  # Increased sleep threshold
+    sleep_threshold=120,
     in_memory=True
 )
 
@@ -80,9 +84,8 @@ def is_image(message: Message) -> bool:
     return False
 
 async def download_image(message: Message, path: Path) -> Path:
-    """Download image with original quality and ensure completion"""
+    """Download image with original quality"""
     if message.photo:
-        # For photos, use the largest available size
         file_id = message.photo.file_id
         ext = ".jpg"
     else:
@@ -90,7 +93,7 @@ async def download_image(message: Message, path: Path) -> Path:
         ext = Path(message.document.file_name or "image").suffix or ".jpg"
     
     # Create a unique filename
-    file_path = path / f"{int(time.time())}_{file_id}{ext}"
+    file_path = path / f"{file_id}{ext}"
     
     # Download with retry mechanism
     for attempt in range(3):
@@ -106,51 +109,68 @@ async def download_image(message: Message, path: Path) -> Path:
     raise Exception("Failed to download image after 3 attempts")
 
 def generate_hq_pdf(images: list, output_path: str) -> int:
-    """Generate high-quality PDF with full-width images"""
+    """
+    Generate high-quality PDF with 3 images per page
+    - Images maintain original aspect ratio
+    - Each image spans full page width
+    - Vertical spacing between images
+    - Page height adjusts to fit 3 images
+    """
     c = canvas.Canvas(output_path, pagesize=A4, pageCompression=0)
     page_count = 0
-    current_y = PAGE_HEIGHT
     
-    for img_path in images:
-        try:
-            # Verify image exists before processing
-            if not img_path.exists():
-                logger.warning(f"Skipping missing file: {img_path}")
-                continue
-                
-            with Image.open(img_path) as img:
-                # Calculate dimensions while maintaining aspect ratio
-                img_width, img_height = img.size
-                aspect = img_height / img_width
-                scaled_width = PAGE_WIDTH
-                scaled_height = scaled_width * aspect
-                
-                # Check if image fits on current page
-                if scaled_height > current_y:
-                    c.showPage()
-                    page_count += 1
-                    current_y = PAGE_HEIGHT
-                
-                # Draw image at full width with original quality
-                c.drawImage(
-                    ImageReader(img),   # Preserve original quality
-                    0,                  # X position (full width)
-                    current_y - scaled_height,  # Y position
-                    width=scaled_width,
-                    height=scaled_height,
-                    preserveAspectRatio=True,
-                    anchor='n',
-                    mask='auto'
-                )
-                
-                # Update vertical position
-                current_y -= scaled_height
-        except Exception as e:
-            logger.error(f"Error processing {img_path}: {e}")
+    # Calculate layout dimensions
+    usable_height = PAGE_HEIGHT - (VERTICAL_SPACING * (IMAGES_PER_PAGE - 1))
+    image_height = usable_height / IMAGES_PER_PAGE
     
-    # Save the last page
-    if current_y < PAGE_HEIGHT:
+    # Process images in batches of IMAGES_PER_PAGE
+    for i in range(0, len(images), IMAGES_PER_PAGE):
         page_count += 1
+        c.showPage()
+        current_y = PAGE_HEIGHT
+        
+        # Process each image in this page
+        for img_path in images[i:i+IMAGES_PER_PAGE]:
+            try:
+                # Verify image exists
+                if not img_path.exists():
+                    logger.warning(f"Skipping missing file: {img_path}")
+                    continue
+                    
+                with Image.open(img_path) as img:
+                    # Calculate dimensions while maintaining aspect ratio
+                    img_width, img_height = img.size
+                    aspect = img_height / img_width
+                    
+                    # Calculate scaled dimensions
+                    scaled_width = PAGE_WIDTH
+                    scaled_height = scaled_width * aspect
+                    
+                    # Adjust if too tall for allocated space
+                    if scaled_height > image_height:
+                        scaled_height = image_height
+                        scaled_width = scaled_height / aspect
+                    
+                    # Center horizontally
+                    x_offset = (PAGE_WIDTH - scaled_width) / 2
+                    
+                    # Draw image with original quality
+                    c.drawImage(
+                        ImageReader(img),
+                        x_offset,
+                        current_y - scaled_height,
+                        width=scaled_width,
+                        height=scaled_height,
+                        preserveAspectRatio=True,
+                        mask='auto'
+                    )
+                    
+                    # Move down for next image
+                    current_y -= scaled_height + VERTICAL_SPACING
+                    
+            except Exception as e:
+                logger.error(f"Error processing {img_path}: {e}")
+    
     c.save()
     return page_count
 
@@ -162,8 +182,12 @@ async def start_command(client: Client, message: Message):
         "1. Send /begin to start a session\n"
         "2. Send your images (photos or documents)\n"
         "3. Send /stop when done\n"
-        "4. Press 'Generate PDF' button\n\n"
-        "I'll create a high-quality PDF with your images at full width!",
+        "4. I'll download all images and create your PDF\n\n"
+        "Features:\n"
+        "- 3 images per page with proper spacing\n"
+        "- Full-width images\n"
+        "- Original image quality\n"
+        "- Custom PDF filename",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
@@ -180,10 +204,10 @@ async def start_session(client: Client, message: Message):
     
     # Initialize session
     sessions[user_id] = {
-        "images": [],
+        "image_refs": [],  # Store message references instead of downloading immediately
         "active": True,
         "dir": user_dir,
-        "media_groups": set()  # Track processed media groups
+        "media_groups": set()
     }
     
     await message.reply(
@@ -195,85 +219,107 @@ async def start_session(client: Client, message: Message):
 
 @app.on_message(filters.command("stop"))
 async def stop_session(client: Client, message: Message):
-    """Stop image collection and show summary"""
+    """Stop image collection and download images"""
     user_id = message.from_user.id
     if user_id not in sessions or not sessions[user_id]["active"]:
         await message.reply("❌ No active session! Send /begin to start.")
         return
     
     sessions[user_id]["active"] = False
-    count = len(sessions[user_id]["images"])
+    count = len(sessions[user_id]["image_refs"])
     
     if count == 0:
         await message.reply("⚠️ No images received! Session canceled.")
         clean_session(user_id)
         return
     
-    # Create confirmation buttons
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Cancel Session", callback_data="cancel")],
-        [InlineKeyboardButton("📤 Generate PDF", callback_data="generate")]
-    ])
+    # Start downloading images with progress updates
+    progress_msg = await message.reply(f"⏳ Downloading 0/{count} images...")
+    sessions[user_id]["downloaded_images"] = []
+    sessions[user_id]["progress_msg"] = progress_msg
     
-    await message.reply(
-        f"🛑 **Session stopped!**\n"
-        f"• Images received: `{count}`\n\n"
-        "Press **Generate PDF** to create your document\n"
-        "or **Cancel Session** to start over.",
-        reply_markup=keyboard,
-        parse_mode=enums.ParseMode.MARKDOWN
+    # Download images in order
+    for idx, img_ref in enumerate(sessions[user_id]["image_refs"]):
+        try:
+            # Update progress
+            await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{count} images...")
+            
+            # Download image
+            img_path = await download_image(img_ref["message"], sessions[user_id]["dir"])
+            sessions[user_id]["downloaded_images"].append(img_path)
+            
+        except Exception as e:
+            logger.error(f"Download error: {e}")
+            await message.reply(f"❌ Failed to download image {idx+1}. Skipping...")
+    
+    # Final progress update
+    success_count = len(sessions[user_id]["downloaded_images"])
+    await progress_msg.edit_text(
+        f"✅ Downloaded {success_count}/{count} images successfully!\n\n"
+        "Please send a name for your PDF file:"
     )
-
-@app.on_callback_query(filters.regex("generate"))
-async def handle_generate(client, callback_query):
-    """Handle PDF generation request"""
-    user_id = callback_query.from_user.id
-    if user_id not in sessions:
-        await callback_query.answer("Session expired!", show_alert=True)
-        return
     
-    await callback_query.answer("Creating your PDF...")
-    await callback_query.message.edit("🔄 **Creating high-quality PDF...**")
-    
-    try:
-        # Generate PDF
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            pdf_path = tmp.name
-        
-        images = sessions[user_id]["images"]
-        page_count = generate_hq_pdf(images, pdf_path)
-        
-        # Send PDF with custom filename
-        await client.send_document(
-            chat_id=user_id,
-            document=pdf_path,
-            file_name="Your_Document.pdf",
-            caption=(
-                f"✅ **PDF Generated!**\n"
-                f"• Images: `{len(images)}`\n"
-                f"• Pages: `{page_count}`\n"
-                f"• Quality: High (Original Resolution)"
-            ),
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-        
-        # Cleanup
-        os.unlink(pdf_path)
-        clean_session(user_id)
-        
-    except Exception as e:
-        logger.error(f"PDF error: {e}")
-        await callback_query.message.edit("❌ Failed to generate PDF. Please try /begin again.")
-        clean_session(user_id)
+    # Set state to wait for PDF name
+    sessions[user_id]["waiting_for_name"] = True
 
-@app.on_callback_query(filters.regex("cancel"))
-async def handle_cancel(client, callback_query):
-    """Handle session cancellation"""
-    user_id = callback_query.from_user.id
+@app.on_message(filters.command("cancel"))
+async def cancel_session(client: Client, message: Message):
+    """Cancel current session"""
+    user_id = message.from_user.id
     if user_id in sessions:
         clean_session(user_id)
-    await callback_query.answer("Session canceled!", show_alert=True)
-    await callback_query.message.edit("❌ Session canceled!")
+    await message.reply("❌ Session canceled!")
+
+@app.on_message(filters.private & filters.text)
+async def handle_text(client: Client, message: Message):
+    """Handle PDF filename input"""
+    user_id = message.from_user.id
+    if user_id not in sessions:
+        return
+    
+    # Handle PDF filename
+    if sessions[user_id].get("waiting_for_name"):
+        # Clean filename
+        filename = message.text.strip()
+        if not filename:
+            await message.reply("⚠️ Please send a valid filename!")
+            return
+        if len(filename) > 50:
+            filename = filename[:50]
+        
+        # Generate PDF
+        try:
+            await message.reply("🔄 Creating your PDF...")
+            
+            # Create PDF
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                pdf_path = tmp.name
+            
+            images = sessions[user_id]["downloaded_images"]
+            page_count = generate_hq_pdf(images, pdf_path)
+            
+            # Send PDF with custom filename
+            await client.send_document(
+                chat_id=user_id,
+                document=pdf_path,
+                file_name=f"{filename}.pdf",
+                caption=(
+                    f"✅ **PDF Generated!**\n"
+                    f"• Images: `{len(images)}`\n"
+                    f"• Pages: `{page_count}`\n"
+                    f"• Layout: 3 images per page with spacing"
+                ),
+                parse_mode=enums.ParseMode.MARKDOWN
+            )
+            
+            # Cleanup
+            os.unlink(pdf_path)
+            clean_session(user_id)
+            
+        except Exception as e:
+            logger.error(f"PDF error: {e}")
+            await message.reply("❌ Failed to generate PDF. Please try /begin again.")
+            clean_session(user_id)
 
 @app.on_message(filters.private & (filters.photo | filters.document | filters.media_group))
 async def handle_image(client: Client, message: Message):
@@ -296,22 +342,20 @@ async def handle_image(client: Client, message: Message):
         sessions[user_id]["media_groups"].add(group_id)
         
         try:
-            # Wait a bit for all parts of the media group to arrive
+            # Wait for all parts of the media group to arrive
             await asyncio.sleep(2)
             media_group = await client.get_media_group(user_id, message.id)
             
-            # Download each image in the group
+            # Store each image in the group
             for msg in media_group:
                 if is_image(msg):
-                    try:
-                        user_dir = sessions[user_id]["dir"]
-                        img_path = await download_image(msg, user_dir)
-                        sessions[user_id]["images"].append(img_path)
-                    except Exception as e:
-                        logger.error(f"Error downloading image from media group: {e}")
+                    sessions[user_id]["image_refs"].append({
+                        "message": msg,
+                        "type": "photo" if msg.photo else "document"
+                    })
             
             # Update user on progress
-            count = len(sessions[user_id]["images"])
+            count = len(sessions[user_id]["image_refs"])
             await message.reply(f"✅ Added {len(media_group)} images from album. Total: `{count}`",
                                parse_mode=enums.ParseMode.MARKDOWN)
         except Exception as e:
@@ -327,13 +371,14 @@ async def handle_image(client: Client, message: Message):
         return
     
     try:
-        # Download image with original quality
-        user_dir = sessions[user_id]["dir"]
-        img_path = await download_image(message, user_dir)
-        sessions[user_id]["images"].append(img_path)
+        # Store image reference (download later)
+        sessions[user_id]["image_refs"].append({
+            "message": message,
+            "type": "photo" if message.photo else "document"
+        })
         
         # Send quick confirmation
-        count = len(sessions[user_id]["images"])
+        count = len(sessions[user_id]["image_refs"])
         if count % 5 == 0:  # Update every 5 images
             await message.reply(f"✅ Added `{count}` images so far...",
                                parse_mode=enums.ParseMode.MARKDOWN)
@@ -344,8 +389,8 @@ async def handle_image(client: Client, message: Message):
 def clean_session(user_id):
     """Clean up user session"""
     if user_id in sessions:
-        user_dir = sessions[user_id]["dir"]
-        if user_dir.exists():
+        user_dir = sessions[user_id].get("dir")
+        if user_dir and user_dir.exists():
             shutil.rmtree(user_dir, ignore_errors=True)
         del sessions[user_id]
 
