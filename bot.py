@@ -6,13 +6,10 @@ import time
 from pathlib import Path
 from PIL import Image
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from flask import Flask, Response
-import aiofiles
-import aiofiles.os
 import logging
 
 # Configure logging
@@ -90,24 +87,28 @@ async def robust_download(message: Message, path: Path) -> Path:
     
     for attempt in range(DOWNLOAD_RETRIES):
         try:
-            await app.download_media(
-                message, 
-                file_name=str(file_path),
-                progress=lambda current, total: None,  # Disable progress reporting
-                in_memory=False
+            # Download with timeout
+            await asyncio.wait_for(
+                app.download_media(message, file_name=str(file_path)),
+                timeout=DOWNLOAD_TIMEOUT
             )
-            if await aiofiles.os.path.exists(file_path):
-                size = (await aiofiles.os.stat(file_path)).st_size
-                if size > 1024:  # Valid file size
-                    return file_path
-                await aiofiles.os.remove(file_path)
+            
+            # Validate file
+            if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
+                return file_path
+                
+            # Cleanup if invalid
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                
         except Exception as e:
             logger.warning(f"Download attempt {attempt+1} failed: {e}")
-        await asyncio.sleep(1)  # Fixed 1s delay between retries
+            
+        await asyncio.sleep(1)  # Wait between retries
     
     raise Exception("Download failed after retries")
 
-async def optimize_image(img_path: Path):
+def optimize_image(img_path: Path):
     """Optimize image size for PDF"""
     try:
         with Image.open(img_path) as img:
@@ -120,13 +121,13 @@ async def optimize_image(img_path: Path):
     except Exception as e:
         logger.error(f"Image optimization failed: {e}")
 
-def generate_pdf(images: list):
-    """Generate PDF with 3 images per page"""
-    # Create a temporary file for PDF
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_pdf.close()
+def generate_pdf(images: list) -> bytes:
+    """Generate PDF with 3 images per page using file paths"""
+    # Create a temporary PDF file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+        pdf_path = tmp_pdf.name
     
-    c = canvas.Canvas(temp_pdf.name, pagesize=A4)
+    c = canvas.Canvas(pdf_path, pagesize=A4)
     page_count = 0
     total_images = len(images)
     
@@ -159,9 +160,9 @@ def generate_pdf(images: list):
                     # Center horizontally
                     x_offset = (A4[0] - width) / 2
                     
-                    # Draw image
+                    # Draw image using file path
                     c.drawImage(
-                        ImageReader(img),
+                        str(img_path),  # Use file path directly
                         x_offset,
                         current_y - height,
                         width=width,
@@ -176,11 +177,11 @@ def generate_pdf(images: list):
     c.save()
     
     # Read PDF into memory
-    with open(temp_pdf.name, "rb") as f:
+    with open(pdf_path, "rb") as f:
         pdf_data = f.read()
     
     # Cleanup temporary file
-    os.unlink(temp_pdf.name)
+    os.unlink(pdf_path)
     return pdf_data
 
 @app.on_message(filters.command("start"))
@@ -225,7 +226,7 @@ async def stop_session(client: Client, message: Message):
     count = len(session["image_refs"])
     
     if count == 0:
-        await clean_session(user_id)
+        clean_session(user_id)
         return await message.reply("⚠️ No images received! Session canceled.")
     
     progress_msg = await message.reply(f"⏳ Downloading 0/{count} images...")
@@ -254,7 +255,8 @@ async def stop_session(client: Client, message: Message):
 async def download_and_process(message, user_dir, idx, progress_msg, total):
     try:
         img_path = await robust_download(message, user_dir)
-        await optimize_image(img_path)
+        # Run optimization in thread pool
+        await asyncio.get_event_loop().run_in_executor(None, optimize_image, img_path)
         
         # Update progress every 5 images
         if (idx + 1) % 5 == 0:
@@ -270,7 +272,7 @@ async def download_and_process(message, user_dir, idx, progress_msg, total):
 async def cancel_session(client: Client, message: Message):
     user_id = message.from_user.id
     if user_id in sessions:
-        await clean_session(user_id)
+        clean_session(user_id)
     await message.reply("❌ Session canceled!")
 
 @app.on_message(filters.private & filters.text)
@@ -285,7 +287,7 @@ async def handle_filename(client: Client, message: Message):
     pdf_progress = await message.reply("🔄 Creating PDF...")
     
     try:
-        # Generate PDF in a thread to avoid blocking
+        # Generate PDF in a thread
         pdf_data = await asyncio.get_event_loop().run_in_executor(
             None,
             generate_pdf,
@@ -297,13 +299,13 @@ async def handle_filename(client: Client, message: Message):
             chat_id=user_id,
             document=pdf_data,
             file_name=f"{filename}.pdf",
-            caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images"
+            caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images • {len(session['downloaded_images'])//IMAGES_PER_PAGE + 1} pages"
         )
     except Exception as e:
         logger.error(f"PDF creation failed: {e}")
         await message.reply("❌ PDF creation failed. Try /begin again.")
     finally:
-        await clean_session(user_id)
+        clean_session(user_id)
 
 @app.on_message(filters.private & (filters.photo | filters.document | filters.media_group))
 async def handle_image(client: Client, message: Message):
@@ -346,12 +348,13 @@ async def handle_image(client: Client, message: Message):
             "sequence": seq
         })
 
-async def clean_session(user_id):
+def clean_session(user_id):
+    """Clean up user session synchronously"""
     if user_id in sessions:
         session = sessions[user_id]
         user_dir = session.get("dir")
-        if user_dir and await aiofiles.os.path.exists(user_dir):
-            await aiofiles.os.rmtree(user_dir, ignore_errors=True)
+        if user_dir and os.path.exists(user_dir):
+            shutil.rmtree(user_dir, ignore_errors=True)
         del sessions[user_id]
 
 def run_bot():
