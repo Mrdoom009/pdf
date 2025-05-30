@@ -3,9 +3,11 @@ import asyncio
 import tempfile
 import shutil
 import time
+import io
 from pathlib import Path
 from PIL import Image
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
@@ -123,11 +125,11 @@ def optimize_image(img_path: Path):
 
 def generate_pdf(images: list) -> bytes:
     """Generate PDF with 3 images per page using file paths"""
-    # Create a temporary PDF file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-        pdf_path = tmp_pdf.name
+    # Create a BytesIO buffer for PDF
+    pdf_buffer = io.BytesIO()
     
-    c = canvas.Canvas(pdf_path, pagesize=A4)
+    # Create canvas directly to memory buffer
+    c = canvas.Canvas(pdf_buffer, pagesize=A4)
     page_count = 0
     total_images = len(images)
     
@@ -143,6 +145,11 @@ def generate_pdf(images: list) -> bytes:
         
         for img_path in batch:
             try:
+                # Verify image exists before processing
+                if not os.path.exists(img_path):
+                    logger.warning(f"Skipping missing file: {img_path}")
+                    continue
+                    
                 with Image.open(img_path) as img:
                     # Get image dimensions
                     img_width, img_height_orig = img.size
@@ -160,9 +167,9 @@ def generate_pdf(images: list) -> bytes:
                     # Center horizontally
                     x_offset = (A4[0] - width) / 2
                     
-                    # Draw image using file path
+                    # Draw image using PIL Image object
                     c.drawImage(
-                        str(img_path),  # Use file path directly
+                        ImageReader(img),
                         x_offset,
                         current_y - height,
                         width=width,
@@ -176,12 +183,9 @@ def generate_pdf(images: list) -> bytes:
     
     c.save()
     
-    # Read PDF into memory
-    with open(pdf_path, "rb") as f:
-        pdf_data = f.read()
-    
-    # Cleanup temporary file
-    os.unlink(pdf_path)
+    # Get PDF data from buffer
+    pdf_data = pdf_buffer.getvalue()
+    pdf_buffer.close()
     return pdf_data
 
 @app.on_message(filters.command("start"))
@@ -295,12 +299,22 @@ async def handle_filename(client: Client, message: Message):
         )
         
         await pdf_progress.edit_text("✅ PDF created! Sending...")
+        
+        # Create temporary file for sending
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_data)
+            tmp_path = tmp.name
+        
+        # Send PDF document
         await client.send_document(
             chat_id=user_id,
-            document=pdf_data,
+            document=tmp_path,
             file_name=f"{filename}.pdf",
             caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images • {len(session['downloaded_images'])//IMAGES_PER_PAGE + 1} pages"
         )
+        
+        # Cleanup temporary file
+        os.unlink(tmp_path)
     except Exception as e:
         logger.error(f"PDF creation failed: {e}")
         await message.reply("❌ PDF creation failed. Try /begin again.")
