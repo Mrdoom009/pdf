@@ -5,6 +5,7 @@ import tempfile
 import shutil
 import threading
 import math
+import time
 from pathlib import Path
 from PIL import Image
 from reportlab.pdfgen import canvas
@@ -17,6 +18,7 @@ from pyrogram.types import (
     Message
 )
 from flask import Flask
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +47,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 IMAGES_PER_PAGE = 3
 VERTICAL_SPACING = 20  # Points between images
 TARGET_DPI = 150       # Balance quality and file size
+MAX_CONCURRENT_DOWNLOADS = 10
 
 # Create Flask app for web server
 flask_app = Flask(__name__)
@@ -70,7 +73,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=100,
+    workers=200,  # Increased workers for better concurrency
     sleep_threshold=120,
     in_memory=True
 )
@@ -105,8 +108,7 @@ async def download_image(message: Message, path: Path) -> Path:
                 return file_path
         except Exception as e:
             logger.warning(f"Download attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(1)
-    
+            await asyncio.sleep(0.5)  # Shorter retry delay
     raise Exception("Failed to download image after 3 attempts")
 
 def optimize_image_size(img_path: Path):
@@ -245,7 +247,8 @@ async def start_session(client: Client, message: Message):
         "image_refs": [],  # Store message references
         "active": True,
         "dir": user_dir,
-        "media_groups": set()
+        "media_groups": set(),
+        "sequence": 0  # Maintain global sequence counter
     }
     
     await message.reply(
@@ -276,23 +279,36 @@ async def stop_session(client: Client, message: Message):
     sessions[user_id]["downloaded_images"] = []
     sessions[user_id]["progress_msg"] = progress_msg
     
-    # Download images in order
-    for idx, img_ref in enumerate(sessions[user_id]["image_refs"]):
-        try:
-            # Update progress
-            await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{count} images...")
-            
-            # Download image
-            img_path = await download_image(img_ref["message"], sessions[user_id]["dir"])
-            
-            # Optimize image size for PDF
-            optimize_image_size(img_path)
-            
-            sessions[user_id]["downloaded_images"].append(img_path)
-            
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            await message.reply(f"❌ Failed to download image {idx+1}. Skipping...")
+    # Sort images by sequence number to maintain order
+    sorted_refs = sorted(sessions[user_id]["image_refs"], key=lambda x: x["sequence"])
+    
+    # Download images in parallel with limited concurrency
+    download_tasks = []
+    for idx, img_ref in enumerate(sorted_refs):
+        task = asyncio.create_task(
+            process_image(
+                img_ref["message"],
+                sessions[user_id]["dir"],
+                idx,
+                progress_msg,
+                count
+            )
+        )
+        download_tasks.append(task)
+    
+    # Wait for all downloads to complete
+    results = await asyncio.gather(*download_tasks, return_exceptions=True)
+    
+    # Process results in order
+    downloaded_images = []
+    for idx, result in enumerate(results):
+        if not isinstance(result, Exception) and result is not None:
+            downloaded_images.append(result)
+        else:
+            logger.error(f"Download failed for image {idx+1}: {result}")
+    
+    sessions[user_id]["downloaded_images"] = sorted(downloaded_images, key=lambda x: x[0])  # Sort by original index
+    sessions[user_id]["downloaded_images"] = [img[1] for img in sessions[user_id]["downloaded_images"]]  # Extract paths
     
     # Final progress update
     success_count = len(sessions[user_id]["downloaded_images"])
@@ -303,6 +319,29 @@ async def stop_session(client: Client, message: Message):
     
     # Set state to wait for PDF name
     sessions[user_id]["waiting_for_name"] = True
+
+async def process_image(message: Message, user_dir: Path, idx: int, progress_msg: Message, total: int):
+    """Download and process a single image with progress updates"""
+    try:
+        # Download image
+        img_path = await download_image(message, user_dir)
+        
+        # Optimize image size for PDF
+        await asyncio.get_event_loop().run_in_executor(
+            None, 
+            optimize_image_size, 
+            img_path
+        )
+        
+        # Update progress every 5 images or when significant
+        if (idx + 1) % 5 == 0 or (idx + 1) == total:
+            await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{total} images...")
+        
+        return (idx, img_path)
+    except Exception as e:
+        logger.error(f"Download error for image {idx+1}: {e}")
+        await progress_msg.reply(f"❌ Failed to download image {idx+1}. Skipping...")
+        return (idx, None)
 
 @app.on_message(filters.command("cancel"))
 async def cancel_session(client: Client, message: Message):
@@ -390,6 +429,10 @@ async def handle_image(client: Client, message: Message):
     if user_id not in sessions or not sessions[user_id]["active"]:
         return
     
+    # Update sequence counter
+    sessions[user_id]["sequence"] += 1
+    seq = sessions[user_id]["sequence"]
+    
     # Handle media groups (albums)
     if message.media_group_id:
         group_id = message.media_group_id
@@ -403,16 +446,20 @@ async def handle_image(client: Client, message: Message):
         
         try:
             # Wait for all parts of the media group to arrive
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced delay
             media_group = await client.get_media_group(user_id, message.id)
             
-            # Store each image in the group
+            # Store each image in the group in sequence order
             for msg in media_group:
                 if is_image(msg):
                     sessions[user_id]["image_refs"].append({
                         "message": msg,
-                        "type": "photo" if msg.photo else "document"
+                        "type": "photo" if msg.photo else "document",
+                        "sequence": seq
                     })
+                    seq += 1  # Increment sequence for each image in group
+            # Update global sequence counter
+            sessions[user_id]["sequence"] = seq
         except Exception as e:
             logger.error(f"Media group error: {e}")
         finally:
@@ -428,7 +475,8 @@ async def handle_image(client: Client, message: Message):
         # Store image reference (download later)
         sessions[user_id]["image_refs"].append({
             "message": message,
-            "type": "photo" if message.photo else "document"
+            "type": "photo" if message.photo else "document",
+            "sequence": seq
         })
     except Exception as e:
         logger.error(f"Image error: {e}")
