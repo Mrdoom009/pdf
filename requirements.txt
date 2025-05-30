@@ -4,3 +4,4 @@ reportlab
 python-dotenv
 supervisor
 flask
+aiofiles
