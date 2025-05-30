@@ -18,7 +18,8 @@ from pyrogram.types import (
     Message
 )
 from flask import Flask
-import concurrent.futures
+import aiofiles
+import aiofiles.os
 
 # Configure logging
 logging.basicConfig(
@@ -47,7 +48,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 IMAGES_PER_PAGE = 3
 VERTICAL_SPACING = 20  # Points between images
 TARGET_DPI = 150       # Balance quality and file size
-MAX_CONCURRENT_DOWNLOADS = 10
+MAX_CONCURRENT_DOWNLOADS = 8  # Optimal for most servers
 
 # Create Flask app for web server
 flask_app = Flask(__name__)
@@ -73,7 +74,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=200,  # Increased workers for better concurrency
+    workers=200,
     sleep_threshold=120,
     in_memory=True
 )
@@ -87,8 +88,8 @@ def is_image(message: Message) -> bool:
         return mime.startswith("image/")
     return False
 
-async def download_image(message: Message, path: Path) -> Path:
-    """Download image with original quality"""
+async def robust_download(client: Client, message: Message, path: Path, max_retries=5) -> Path:
+    """Robust image download with advanced error handling"""
     if message.photo:
         file_id = message.photo.file_id
         ext = ".jpg"
@@ -97,19 +98,38 @@ async def download_image(message: Message, path: Path) -> Path:
         ext = Path(message.document.file_name or "image").suffix or ".jpg"
     
     # Create a unique filename
-    file_path = path / f"{file_id}{ext}"
+    file_path = path / f"{int(time.time())}_{file_id}{ext}"
     
-    # Download with retry mechanism
-    for attempt in range(3):
+    # Download with exponential backoff retry
+    for attempt in range(max_retries):
         try:
-            await message.download(file_name=str(file_path))
+            # Try downloading with timeout
+            await asyncio.wait_for(
+                client.download_media(message, file_name=str(file_path)),
+                timeout=120  # 2 minute timeout
+            )
+            
             # Verify file exists and has content
-            if file_path.exists() and file_path.stat().st_size > 0:
-                return file_path
+            if await aiofiles.os.path.exists(file_path):
+                file_size = (await aiofiles.os.stat(file_path)).st_size
+                if file_size > 1024:  # At least 1KB
+                    return file_path
+                else:
+                    logger.warning(f"Small file detected: {file_path} ({file_size} bytes)")
+            
+            # If file is invalid, delete it
+            if await aiofiles.os.path.exists(file_path):
+                await aiofiles.os.remove(file_path)
+                
+        except asyncio.TimeoutError:
+            logger.warning(f"Download timeout (attempt {attempt+1}/{max_retries})")
         except Exception as e:
-            logger.warning(f"Download attempt {attempt+1} failed: {e}")
-            await asyncio.sleep(0.5)  # Shorter retry delay
-    raise Exception("Failed to download image after 3 attempts")
+            logger.warning(f"Download attempt {attempt+1}/{max_retries} failed: {e}")
+        
+        # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+        await asyncio.sleep(2 ** attempt)
+    
+    raise Exception(f"Failed to download after {max_retries} attempts")
 
 def optimize_image_size(img_path: Path):
     """Resize image to target DPI for PDF optimization"""
@@ -282,11 +302,12 @@ async def stop_session(client: Client, message: Message):
     # Sort images by sequence number to maintain order
     sorted_refs = sorted(sessions[user_id]["image_refs"], key=lambda x: x["sequence"])
     
-    # Download images in parallel with limited concurrency
+    # Download images with enhanced concurrency control
     download_tasks = []
     for idx, img_ref in enumerate(sorted_refs):
         task = asyncio.create_task(
             process_image(
+                client,
                 img_ref["message"],
                 sessions[user_id]["dir"],
                 idx,
@@ -303,12 +324,14 @@ async def stop_session(client: Client, message: Message):
     downloaded_images = []
     for idx, result in enumerate(results):
         if not isinstance(result, Exception) and result is not None:
-            downloaded_images.append(result)
+            downloaded_images.append((idx, result))
         else:
             logger.error(f"Download failed for image {idx+1}: {result}")
+            await progress_msg.reply(f"❌ Failed to download image {idx+1}. Skipping...")
     
-    sessions[user_id]["downloaded_images"] = sorted(downloaded_images, key=lambda x: x[0])  # Sort by original index
-    sessions[user_id]["downloaded_images"] = [img[1] for img in sessions[user_id]["downloaded_images"]]  # Extract paths
+    # Sort by original index and extract paths
+    downloaded_images.sort(key=lambda x: x[0])
+    sessions[user_id]["downloaded_images"] = [img[1] for img in downloaded_images]
     
     # Final progress update
     success_count = len(sessions[user_id]["downloaded_images"])
@@ -320,11 +343,11 @@ async def stop_session(client: Client, message: Message):
     # Set state to wait for PDF name
     sessions[user_id]["waiting_for_name"] = True
 
-async def process_image(message: Message, user_dir: Path, idx: int, progress_msg: Message, total: int):
+async def process_image(client: Client, message: Message, user_dir: Path, idx: int, progress_msg: Message, total: int):
     """Download and process a single image with progress updates"""
     try:
-        # Download image
-        img_path = await download_image(message, user_dir)
+        # Download image with robust mechanism
+        img_path = await robust_download(client, message, user_dir)
         
         # Optimize image size for PDF
         await asyncio.get_event_loop().run_in_executor(
@@ -337,11 +360,10 @@ async def process_image(message: Message, user_dir: Path, idx: int, progress_msg
         if (idx + 1) % 5 == 0 or (idx + 1) == total:
             await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{total} images...")
         
-        return (idx, img_path)
+        return img_path
     except Exception as e:
         logger.error(f"Download error for image {idx+1}: {e}")
-        await progress_msg.reply(f"❌ Failed to download image {idx+1}. Skipping...")
-        return (idx, None)
+        return e  # Return exception for handling
 
 @app.on_message(filters.command("cancel"))
 async def cancel_session(client: Client, message: Message):
@@ -445,8 +467,7 @@ async def handle_image(client: Client, message: Message):
         sessions[user_id]["media_groups"].add(group_id)
         
         try:
-            # Wait for all parts of the media group to arrive
-            await asyncio.sleep(1)  # Reduced delay
+            # Get media group immediately without delay
             media_group = await client.get_media_group(user_id, message.id)
             
             # Store each image in the group in sequence order
@@ -458,10 +479,12 @@ async def handle_image(client: Client, message: Message):
                         "sequence": seq
                     })
                     seq += 1  # Increment sequence for each image in group
+            
             # Update global sequence counter
             sessions[user_id]["sequence"] = seq
         except Exception as e:
             logger.error(f"Media group error: {e}")
+            await message.reply("⚠️ Failed to process image album. Some images might be missing.")
         finally:
             # Remove group from processing set
             sessions[user_id]["media_groups"].discard(group_id)
@@ -481,12 +504,12 @@ async def handle_image(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Image error: {e}")
 
-def clean_session(user_id):
-    """Clean up user session"""
+async def clean_session(user_id):
+    """Clean up user session asynchronously"""
     if user_id in sessions:
         user_dir = sessions[user_id].get("dir")
-        if user_dir and user_dir.exists():
-            shutil.rmtree(user_dir, ignore_errors=True)
+        if user_dir and await aiofiles.os.path.exists(user_dir):
+            await aiofiles.os.rmtree(user_dir, ignore_errors=True)
         del sessions[user_id]
 
 def run_bot():
