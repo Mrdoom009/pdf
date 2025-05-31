@@ -34,7 +34,7 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 TEMP_DIR = Path("user_data")
 TEMP_DIR.mkdir(exist_ok=True)
 IMAGES_PER_PAGE = 3
-VERTICAL_SPACING = 20
+VERTICAL_SPACING = 0
 TARGET_DPI = 150
 MAX_CONCURRENT_DOWNLOADS = 8
 DOWNLOAD_TIMEOUT = 180
@@ -123,65 +123,98 @@ def optimize_image(img_path: Path):
     except Exception as e:
         logger.error(f"Image optimization failed: {e}")
 
-def generate_pdf(images: list) -> bytes:
-    """Generate PDF with 3 images per page using file paths"""
-    # Create a BytesIO buffer for PDF
+def generate_pdf(images: list, mode: str = 'grid') -> bytes:
+    """Generate PDF based on mode (grid or single)"""
     pdf_buffer = io.BytesIO()
     
-    # Create canvas directly to memory buffer
-    c = canvas.Canvas(pdf_buffer, pagesize=A4)
-    page_count = 0
-    total_images = len(images)
-    
-    for i in range(0, total_images, IMAGES_PER_PAGE):
-        if page_count > 0:
-            c.showPage()
-        page_count += 1
+    if mode == 'single':
+        # Single image per page mode
+        c = canvas.Canvas(pdf_buffer)
+        page_count = 0
         
-        current_y = A4[1]
-        batch = images[i:i+IMAGES_PER_PAGE]
-        available_height = A4[1] - (VERTICAL_SPACING * (len(batch) - 1))
-        img_height = available_height / len(batch)
-        
-        for img_path in batch:
+        for img_path in images:
             try:
-                # Verify image exists before processing
                 if not os.path.exists(img_path):
                     logger.warning(f"Skipping missing file: {img_path}")
                     continue
                     
                 with Image.open(img_path) as img:
-                    # Get image dimensions
-                    img_width, img_height_orig = img.size
-                    aspect = img_height_orig / img_width
+                    width, height = img.size
                     
-                    # Calculate dimensions
-                    width = A4[0]
-                    height = width * aspect
+                    # Create page with image dimensions
+                    c.setPageSize((width, height))
                     
-                    # Adjust if too tall
-                    if height > img_height:
-                        height = img_height
-                        width = height / aspect
-                    
-                    # Center horizontally
-                    x_offset = (A4[0] - width) / 2
-                    
-                    # Draw image using PIL Image object
+                    # Draw the image to fill the entire page
                     c.drawImage(
                         ImageReader(img),
-                        x_offset,
-                        current_y - height,
+                        0, 0,
                         width=width,
                         height=height,
                         preserveAspectRatio=True,
+                        anchor='c',
                         mask='auto'
                     )
-                    current_y -= height + VERTICAL_SPACING
+                    
+                    # Start new page for next image
+                    if page_count > 0:
+                        c.showPage()
+                    page_count += 1
+                    
             except Exception as e:
                 logger.error(f"Error drawing image: {e}")
+        
+        if page_count > 0:
+            c.save()
     
-    c.save()
+    else:
+        # Grid mode (3 images per page)
+        c = canvas.Canvas(pdf_buffer, pagesize=A4)
+        page_count = 0
+        total_images = len(images)
+        
+        for i in range(0, total_images, IMAGES_PER_PAGE):
+            if page_count > 0:
+                c.showPage()
+            page_count += 1
+            
+            current_y = A4[1]
+            batch = images[i:i+IMAGES_PER_PAGE]
+            available_height = A4[1] - (VERTICAL_SPACING * (len(batch) - 1))
+            img_height = available_height / len(batch)
+            
+            for img_path in batch:
+                try:
+                    if not os.path.exists(img_path):
+                        logger.warning(f"Skipping missing file: {img_path}")
+                        continue
+                        
+                    with Image.open(img_path) as img:
+                        img_width, img_height_orig = img.size
+                        aspect = img_height_orig / img_width
+                        
+                        width = A4[0]
+                        height = width * aspect
+                        
+                        if height > img_height:
+                            height = img_height
+                            width = height / aspect
+                        
+                        x_offset = (A4[0] - width) / 2
+                        
+                        c.drawImage(
+                            ImageReader(img),
+                            x_offset,
+                            current_y - height,
+                            width=width,
+                            height=height,
+                            preserveAspectRatio=True,
+                            mask='auto'
+                        )
+                        current_y -= height + VERTICAL_SPACING
+                except Exception as e:
+                    logger.error(f"Error drawing image: {e}")
+        
+        c.save()
     
     # Get PDF data from buffer
     pdf_data = pdf_buffer.getvalue()
@@ -192,14 +225,15 @@ def generate_pdf(images: list) -> bytes:
 async def start_command(client: Client, message: Message):
     await message.reply(
         "🖼️ **Image to PDF Bot**\n\n"
-        "• /begin - Start session\n"
+        "• /begin - Create PDF with 3 images per page\n"
+        "• /begin2 - Create PDF with 1 image per page\n"
         "• /stop - Finish & create PDF\n"
         "• /cancel - Cancel session\n\n"
-        "Features: 3 images/page, full-width, ordered, HQ",
+        "Features: Full-width images, ordered, HQ",
         parse_mode=enums.ParseMode.MARKDOWN
     )
 
-@app.on_message(filters.command("begin"))
+@app.on_message(filters.command(["begin", "begin2"]))
 async def start_session(client: Client, message: Message):
     user_id = message.from_user.id
     user_dir = TEMP_DIR / str(user_id)
@@ -208,15 +242,20 @@ async def start_session(client: Client, message: Message):
         shutil.rmtree(user_dir, ignore_errors=True)
     user_dir.mkdir(parents=True, exist_ok=True)
     
+    # Determine mode from command
+    mode = 'single' if message.command[0] == "begin2" else 'grid'
+    
     sessions[user_id] = {
         "image_refs": [],
         "active": True,
         "dir": user_dir,
         "media_groups": set(),
-        "sequence": 0
+        "sequence": 0,
+        "mode": mode  # Store the PDF mode
     }
     
-    await message.reply("📸 Session started! Send images now. /stop when done.")
+    mode_desc = "1 image per page" if mode == 'single' else "3 images per page"
+    await message.reply(f"📸 Session started in {mode_desc} mode! Send images now. /stop when done.")
 
 @app.on_message(filters.command("stop"))
 async def stop_session(client: Client, message: Message):
@@ -224,7 +263,7 @@ async def stop_session(client: Client, message: Message):
     session = sessions.get(user_id)
     
     if not session or not session["active"]:
-        return await message.reply("❌ No active session! /begin to start.")
+        return await message.reply("❌ No active session! /begin or /begin2 to start.")
     
     session["active"] = False
     count = len(session["image_refs"])
@@ -295,7 +334,8 @@ async def handle_filename(client: Client, message: Message):
         pdf_data = await asyncio.get_event_loop().run_in_executor(
             None,
             generate_pdf,
-            session["downloaded_images"]
+            session["downloaded_images"],
+            session["mode"]  # Pass the mode to PDF generator
         )
         
         await pdf_progress.edit_text("✅ PDF created! Sending...")
@@ -305,19 +345,22 @@ async def handle_filename(client: Client, message: Message):
             tmp.write(pdf_data)
             tmp_path = tmp.name
         
+        # Determine page count
+        page_count = len(session["downloaded_images"]) if session["mode"] == 'single' else len(session["downloaded_images"]) // IMAGES_PER_PAGE + 1
+        
         # Send PDF document
         await client.send_document(
             chat_id=user_id,
             document=tmp_path,
             file_name=f"{filename}.pdf",
-            caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images • {len(session['downloaded_images'])//IMAGES_PER_PAGE + 1} pages"
+            caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images • {page_count} pages"
         )
         
         # Cleanup temporary file
         os.unlink(tmp_path)
     except Exception as e:
         logger.error(f"PDF creation failed: {e}")
-        await message.reply("❌ PDF creation failed. Try /begin again.")
+        await message.reply("❌ PDF creation failed. Try /begin or /begin2 again.")
     finally:
         clean_session(user_id)
 
