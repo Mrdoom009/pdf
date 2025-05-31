@@ -2,6 +2,6 @@ pyrofork
 Pillow
 reportlab
 python-dotenv
-supervisor
+tgcrypto
 flask
 aiofiles
