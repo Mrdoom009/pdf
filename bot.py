@@ -13,6 +13,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from flask import Flask, Response
 import logging
+import traceback
 
 # Configure logging
 logging.basicConfig(
@@ -34,11 +35,11 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 TEMP_DIR = Path("user_data")
 TEMP_DIR.mkdir(exist_ok=True)
 IMAGES_PER_PAGE = 3
-VERTICAL_SPACING = 0
+VERTICAL_SPACING = 20
 TARGET_DPI = 150
-MAX_CONCURRENT_DOWNLOADS = 8
-DOWNLOAD_TIMEOUT = 180
-DOWNLOAD_RETRIES = 5
+MAX_CONCURRENT_DOWNLOADS = 6  # Reduced for better stability
+DOWNLOAD_TIMEOUT = 300  # Increased to 5 minutes
+DOWNLOAD_RETRIES = 7  # Increased retries
 
 # Session management
 sessions = {}
@@ -68,8 +69,8 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workers=200,
-    sleep_threshold=120,
+    workers=100,  # Reduced workers for stability
+    sleep_threshold=180,  # Increased sleep threshold
     in_memory=True
 )
 
@@ -87,9 +88,12 @@ async def robust_download(message: Message, path: Path) -> Path:
     ext = ".jpg" if message.photo else Path(message.document.file_name or "image").suffix or ".jpg"
     file_path = path / f"{int(time.time())}_{file_id}{ext}"
     
-    for attempt in range(DOWNLOAD_RETRIES):
+    logger.info(f"Starting download for file: {file_path}")
+    
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
             # Download with timeout
+            logger.info(f"Attempt {attempt}/{DOWNLOAD_RETRIES} for file {file_id}")
             await asyncio.wait_for(
                 app.download_media(message, file_name=str(file_path)),
                 timeout=DOWNLOAD_TIMEOUT
@@ -97,18 +101,22 @@ async def robust_download(message: Message, path: Path) -> Path:
             
             # Validate file
             if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
+                logger.info(f"Download successful: {file_path} ({os.path.getsize(file_path)} bytes)")
                 return file_path
                 
             # Cleanup if invalid
             if os.path.exists(file_path):
+                logger.warning(f"Small file detected: {file_path} ({os.path.getsize(file_path)} bytes)")
                 os.remove(file_path)
                 
+        except asyncio.TimeoutError:
+            logger.warning(f"Download timeout on attempt {attempt}")
         except Exception as e:
-            logger.warning(f"Download attempt {attempt+1} failed: {e}")
+            logger.warning(f"Download error on attempt {attempt}: {str(e)}")
             
-        await asyncio.sleep(1)  # Wait between retries
+        await asyncio.sleep(2 ** attempt)  # Exponential backoff
     
-    raise Exception("Download failed after retries")
+    raise Exception(f"Download failed after {DOWNLOAD_RETRIES} attempts")
 
 def optimize_image(img_path: Path):
     """Optimize image size for PDF"""
@@ -118,6 +126,7 @@ def optimize_image(img_path: Path):
             max_height = int((A4[1] / 72) * TARGET_DPI)
             
             if img.width > max_width or img.height > max_height:
+                logger.info(f"Optimizing image: {img_path}")
                 img.thumbnail((max_width, max_height), Image.LANCZOS)
                 img.save(img_path, quality=90, optimize=True)
     except Exception as e:
@@ -125,14 +134,18 @@ def optimize_image(img_path: Path):
 
 def generate_pdf(images: list, mode: str = 'grid') -> bytes:
     """Generate PDF based on mode (grid or single)"""
+    if not images:
+        raise ValueError("No images to process")
+    
     pdf_buffer = io.BytesIO()
+    logger.info(f"Generating PDF in {mode} mode with {len(images)} images")
     
     if mode == 'single':
         # Single image per page mode
         c = canvas.Canvas(pdf_buffer)
         page_count = 0
         
-        for img_path in images:
+        for i, img_path in enumerate(images):
             try:
                 if not os.path.exists(img_path):
                     logger.warning(f"Skipping missing file: {img_path}")
@@ -140,6 +153,7 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
                     
                 with Image.open(img_path) as img:
                     width, height = img.size
+                    logger.info(f"Processing image {i+1}: {img_path} ({width}x{height})")
                     
                     # Create page with image dimensions
                     c.setPageSize((width, height))
@@ -155,13 +169,15 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
                         mask='auto'
                     )
                     
-                    # Start new page for next image
-                    if page_count > 0:
+                    # End page and start new one (except for last image)
+                    if i < len(images) - 1:
                         c.showPage()
+                    
                     page_count += 1
                     
             except Exception as e:
-                logger.error(f"Error drawing image: {e}")
+                logger.error(f"Error processing image {img_path}: {e}")
+                logger.error(traceback.format_exc())
         
         if page_count > 0:
             c.save()
@@ -173,6 +189,7 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
         total_images = len(images)
         
         for i in range(0, total_images, IMAGES_PER_PAGE):
+            # Start new page if not first page
             if page_count > 0:
                 c.showPage()
             page_count += 1
@@ -182,7 +199,9 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
             available_height = A4[1] - (VERTICAL_SPACING * (len(batch) - 1))
             img_height = available_height / len(batch)
             
-            for img_path in batch:
+            logger.info(f"Processing page {page_count} with {len(batch)} images")
+            
+            for j, img_path in enumerate(batch):
                 try:
                     if not os.path.exists(img_path):
                         logger.warning(f"Skipping missing file: {img_path}")
@@ -201,6 +220,8 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
                         
                         x_offset = (A4[0] - width) / 2
                         
+                        logger.info(f"  - Image {j+1}: {width}x{height} at {current_y}")
+                        
                         c.drawImage(
                             ImageReader(img),
                             x_offset,
@@ -212,13 +233,19 @@ def generate_pdf(images: list, mode: str = 'grid') -> bytes:
                         )
                         current_y -= height + VERTICAL_SPACING
                 except Exception as e:
-                    logger.error(f"Error drawing image: {e}")
+                    logger.error(f"Error processing image {img_path}: {e}")
+                    logger.error(traceback.format_exc())
         
         c.save()
     
     # Get PDF data from buffer
     pdf_data = pdf_buffer.getvalue()
     pdf_buffer.close()
+    
+    if len(pdf_data) == 0:
+        raise RuntimeError("Generated PDF is empty")
+    
+    logger.info(f"PDF generated successfully: {len(pdf_data)} bytes")
     return pdf_data
 
 @app.on_message(filters.command("start"))
@@ -286,9 +313,19 @@ async def stop_session(client: Client, message: Message):
         download_tasks.append(task)
     
     results = await asyncio.gather(*download_tasks, return_exceptions=True)
-    session["downloaded_images"] = [r for r in results if not isinstance(r, Exception) and r is not None]
     
+    # Process results in order
+    downloaded_images = []
+    for idx, result in enumerate(results):
+        if not isinstance(result, Exception) and result is not None:
+            downloaded_images.append(result)
+        else:
+            logger.error(f"Download failed for image {idx+1}: {result}")
+            await progress_msg.reply(f"❌ Failed image {idx+1}. Skipping...")
+    
+    session["downloaded_images"] = downloaded_images
     success = len(session["downloaded_images"])
+    
     await progress_msg.edit_text(
         f"✅ Downloaded {success}/{count} images!\n"
         "📝 Send PDF filename:"
@@ -297,18 +334,18 @@ async def stop_session(client: Client, message: Message):
 
 async def download_and_process(message, user_dir, idx, progress_msg, total):
     try:
+        # Update progress every 2 images for better feedback
+        if (idx + 1) % 2 == 0 or (idx + 1) == total:
+            await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{total} images...")
+        
         img_path = await robust_download(message, user_dir)
+        
         # Run optimization in thread pool
         await asyncio.get_event_loop().run_in_executor(None, optimize_image, img_path)
-        
-        # Update progress every 5 images
-        if (idx + 1) % 5 == 0:
-            await progress_msg.edit_text(f"⏳ Downloading {idx+1}/{total} images...")
         
         return img_path
     except Exception as e:
         logger.error(f"Image processing failed: {e}")
-        await progress_msg.reply(f"❌ Failed image {idx+1}. Skipping...")
         return None
 
 @app.on_message(filters.command("cancel"))
@@ -346,20 +383,30 @@ async def handle_filename(client: Client, message: Message):
             tmp_path = tmp.name
         
         # Determine page count
-        page_count = len(session["downloaded_images"]) if session["mode"] == 'single' else len(session["downloaded_images"]) // IMAGES_PER_PAGE + 1
+        if session["mode"] == 'single':
+            page_count = len(session["downloaded_images"])
+        else:
+            page_count = (len(session["downloaded_images"]) + IMAGES_PER_PAGE - 1) // IMAGES_PER_PAGE
         
         # Send PDF document
         await client.send_document(
             chat_id=user_id,
             document=tmp_path,
             file_name=f"{filename}.pdf",
-            caption=f"✅ PDF Generated • {len(session['downloaded_images'])} images • {page_count} pages"
+            caption=(
+                f"✅ PDF Generated\n"
+                f"• Images: {len(session['downloaded_images'])}\n"
+                f"• Pages: {page_count}\n"
+                f"• Mode: {'1 image per page' if session['mode'] == 'single' else '3 images per page'}"
+            ),
+            parse_mode=enums.ParseMode.MARKDOWN
         )
         
         # Cleanup temporary file
         os.unlink(tmp_path)
     except Exception as e:
         logger.error(f"PDF creation failed: {e}")
+        logger.error(traceback.format_exc())
         await message.reply("❌ PDF creation failed. Try /begin or /begin2 again.")
     finally:
         clean_session(user_id)
@@ -372,6 +419,7 @@ async def handle_image(client: Client, message: Message):
     if not session or not session["active"]:
         return
     
+    # Update sequence counter before processing
     session["sequence"] += 1
     seq = session["sequence"]
     
@@ -385,6 +433,8 @@ async def handle_image(client: Client, message: Message):
         
         try:
             media_group = await client.get_media_group(user_id, message.id)
+            
+            # Process media group in order
             for msg in media_group:
                 if is_image(msg):
                     session["image_refs"].append({
@@ -392,9 +442,12 @@ async def handle_image(client: Client, message: Message):
                         "sequence": seq
                     })
                     seq += 1
+            
+            # Update global sequence counter
             session["sequence"] = seq
         except Exception as e:
             logger.error(f"Media group error: {e}")
+            logger.error(traceback.format_exc())
         finally:
             session["media_groups"].discard(group_id)
         return
@@ -411,7 +464,11 @@ def clean_session(user_id):
         session = sessions[user_id]
         user_dir = session.get("dir")
         if user_dir and os.path.exists(user_dir):
-            shutil.rmtree(user_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(user_dir, ignore_errors=True)
+                logger.info(f"Cleaned session data for user {user_id}")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
         del sessions[user_id]
 
 def run_bot():
@@ -420,8 +477,11 @@ def run_bot():
             logger.info("Starting Telegram bot...")
             app.run()
         except Exception as e:
-            logger.error(f"Bot crashed: {e} - Restarting in 5s")
+            logger.error(f"Bot crashed: {e}")
+            logger.error(traceback.format_exc())
+            logger.info("Restarting bot in 5s")
             time.sleep(5)
 
 if __name__ == "__main__":
+    logger.info("Starting PDF Converter Bot with Flask server...")
     run_bot()
