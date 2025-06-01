@@ -8,7 +8,6 @@ import re
 import io
 from pathlib import Path
 from PIL import Image
-from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfgen import canvas
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -86,39 +85,31 @@ async def download_image(message: Message, path: Path) -> Path:
     raise Exception("Download failed")
 
 def generate_pdf(images: list) -> bytes:
-    """Generate PDF with one image per page, scaled to fit A4 landscape"""
+    """Generate PDF with images filling entire pages"""
     pdf_buffer = io.BytesIO()
     c = canvas.Canvas(pdf_buffer)
-    
-    # Use landscape A4 for all pages
-    page_width, page_height = landscape(A4)
     
     for img_path in images:
         try:
             with Image.open(img_path) as img:
-                # Calculate scaling to fit page
-                img_ratio = img.width / img.height
-                page_ratio = page_width / page_height
+                # Get image dimensions
+                img_width, img_height = img.size
+                aspect_ratio = img_width / img_height
                 
-                if img_ratio > page_ratio:
-                    # Image is wider than page - fit to width
-                    draw_width = page_width
-                    draw_height = draw_width / img_ratio
-                else:
-                    # Image is taller than page - fit to height
-                    draw_height = page_height
-                    draw_width = draw_height * img_ratio
+                # Create a full-page canvas with image's aspect ratio
+                page_width = 595  # A4 width in points (8.27 inches)
+                page_height = page_width / aspect_ratio
                 
-                # Center image on page
-                x = (page_width - draw_width) / 2
-                y = (page_height - draw_height) / 2
-                
-                # Draw scaled image
+                # Set page size based on image dimensions
                 c.setPageSize((page_width, page_height))
+                
+                # Draw image to fill entire page
                 c.drawImage(
-                    str(img_path), x, y,
-                    width=draw_width, height=draw_height,
-                    preserveAspectRatio=True
+                    str(img_path), 
+                    0, 0, 
+                    width=page_width, 
+                    height=page_height,
+                    preserveAspectRatio=False
                 )
                 c.showPage()
         except Exception:
