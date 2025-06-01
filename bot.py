@@ -5,6 +5,7 @@ import tempfile
 import shutil
 import time
 import re
+import io  # Added missing import
 from pathlib import Path
 from PIL import Image
 from reportlab.lib.pagesizes import A4
@@ -77,13 +78,13 @@ async def download_image(message: Message, path: Path) -> Path:
     for attempt in range(DOWNLOAD_RETRIES):
         try:
             await app.download_media(message, file_name=str(file_path))
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
+            if file_path.exists() and file_path.stat().st_size > 1024:
                 return file_path
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Download attempt {attempt+1} failed: {e}")
         await asyncio.sleep(2 ** attempt)
     
-    raise Exception("Download failed")
+    raise Exception("Download failed after multiple attempts")
 
 def generate_pdf(images: list) -> bytes:
     """Generate PDF with one image per page"""
@@ -91,18 +92,21 @@ def generate_pdf(images: list) -> bytes:
     c = canvas.Canvas(pdf_buffer)
     
     for img_path in images:
-        with Image.open(img_path) as img:
-            # Set page size to image dimensions
-            c.setPageSize((img.width, img.height))
-            
-            # Draw image to fill entire page
-            c.drawImage(
-                img_path, 0, 0,
-                width=img.width, height=img.height,
-                preserveAspectRatio=True
-            )
-            # Start new page for next image
-            c.showPage()
+        try:
+            with Image.open(img_path) as img:
+                # Set page size to image dimensions
+                c.setPageSize((img.width, img.height))
+                
+                # Draw image to fill entire page
+                c.drawImage(
+                    str(img_path), 0, 0,
+                    width=img.width, height=img.height,
+                    preserveAspectRatio=True
+                )
+                # Start new page for next image
+                c.showPage()
+        except Exception as e:
+            print(f"Skipping invalid image {img_path}: {e}")
     
     c.save()
     return pdf_buffer.getvalue()
@@ -120,7 +124,8 @@ async def start_session(_, message: Message):
     sessions[user_id] = {
         "images": [],  # Store messages in order
         "dir": user_dir,
-        "active": True
+        "active": True,
+        "media_groups": set()  # Track processed media groups
     }
     
     await message.reply("📸 Session started! Send images. /stop when done.")
@@ -148,8 +153,13 @@ async def stop_session(_, message: Message):
             downloaded.append(img_path)
             if (idx + 1) % 5 == 0:
                 await progress_msg.edit_text(f"⏳ Downloaded {idx+1}/{len(session['images'])} images...")
-        except Exception:
+        except Exception as e:
+            print(f"Image download failed: {e}")
             await progress_msg.reply(f"❌ Failed image {idx+1}. Skipping...")
+    
+    if not downloaded:
+        clean_session(user_id)
+        return await progress_msg.edit_text("❌ All downloads failed! Session aborted.")
     
     # Request filename
     await progress_msg.edit_text("✅ Download complete! Send PDF filename:")
@@ -169,7 +179,7 @@ async def handle_filename(client: Client, message: Message):
     if not filename:
         filename = "document"
     
-    # Generate PDF
+    tmp_path = None
     try:
         pdf_data = generate_pdf(session["downloaded"])
         
@@ -185,14 +195,16 @@ async def handle_filename(client: Client, message: Message):
             file_name=f"{filename}.pdf",
             caption=f"✅ PDF Generated • {len(session['downloaded'])} pages"
         )
-    except Exception:
+    except Exception as e:
+        print(f"PDF creation failed: {e}")
         await message.reply("❌ PDF creation failed")
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
         clean_session(user_id)
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 @app.on_message(filters.private & (filters.photo | filters.document | filters.media_group))
 async def handle_image(_, message: Message):
@@ -204,33 +216,42 @@ async def handle_image(_, message: Message):
     
     # Handle media groups
     if message.media_group_id:
+        # Skip if already processed
+        if message.media_group_id in session["media_groups"]:
+            return
+            
+        session["media_groups"].add(message.media_group_id)
+        
         try:
             media_group = await app.get_media_group(message.chat.id, message.id)
-            session["images"].extend(media_group)
-        except Exception:
-            pass
+            # Filter only valid images
+            session["images"].extend([msg for msg in media_group if is_image(msg)])
+        except Exception as e:
+            print(f"Media group error: {e}")
         return
     
     # Handle single image
-    session["images"].append(message)
+    if is_image(message):
+        session["images"].append(message)
 
 def clean_session(user_id):
     """Cleanup session data"""
     if user_id in sessions:
         session = sessions.pop(user_id)
         user_dir = session.get("dir")
-        if user_dir and os.path.exists(user_dir):
+        if user_dir and user_dir.exists():
             try:
                 shutil.rmtree(user_dir, ignore_errors=True)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Cleanup error: {e}")
 
 def run_bot():
     while True:
         try:
             print("Starting Telegram bot...")
             app.run()
-        except Exception:
+        except Exception as e:
+            print(f"Bot crashed: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
