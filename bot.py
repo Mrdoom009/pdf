@@ -10,7 +10,7 @@ from pathlib import Path
 from PIL import Image
 from reportlab.pdfgen import canvas
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, ReplyKeyboardMarkup, ReplyKeyboardRemove, ForceReply
 from flask import Flask, Response
 import threading
 
@@ -25,7 +25,6 @@ if not all([API_ID, API_HASH, BOT_TOKEN]):
 # Configuration
 TEMP_DIR = Path("user_data")
 TEMP_DIR.mkdir(exist_ok=True)
-DOWNLOAD_TIMEOUT = 300
 DOWNLOAD_RETRIES = 5
 
 # Session management
@@ -34,7 +33,7 @@ sessions = {}
 # Flask server setup
 flask_app = Flask(__name__)
 
-@flask_app.route('/health')
+@flask_app.route('/')
 def health_check():
     return Response("OK", status=200)
 
@@ -42,8 +41,9 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=8000)
 
 # Start Flask thread
-flask_thread = threading.Thread(target=run_flask, daemon=True)
-flask_thread.start()
+t = threading.Thread(target=run_flask, daemon=True)
+
+t.start()
 time.sleep(1)
 
 # Pyrogram client
@@ -57,173 +57,148 @@ app = Client(
     in_memory=True
 )
 
+
 def is_image(message: Message) -> bool:
     return bool(message.photo or 
-               (message.document and message.document.mime_type and 
-                message.document.mime_type.startswith("image/")))
+               (message.document and message.document.mime_type 
+                and message.document.mime_type.startswith("image/")))
 
-async def download_image(message: Message, path: Path) -> Path:
-    file_id = message.photo.file_id if message.photo else message.document.file_id
-    
-    if message.photo:
-        ext = ".jpg"
-    else:
-        fname = message.document.file_name or "image"
-        ext = Path(fname).suffix or ".jpg"
-    
-    file_path = path / f"{file_id}{ext}"
-    
-    for attempt in range(DOWNLOAD_RETRIES):
+async def download_image(msg: Message, path: Path) -> Path:
+    file_id = msg.photo.file_id if msg.photo else msg.document.file_id
+    ext = ".jpg" if msg.photo else Path(msg.document.file_name or "image").suffix or ".jpg"
+    destination = path / f"{file_id}{ext}"
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
-            await app.download_media(message, file_name=str(file_path))
-            if file_path.exists() and file_path.stat().st_size > 1024:
-                return file_path
+            await app.download_media(msg, file_name=str(destination))
+            if destination.exists() and destination.stat().st_size > 1024:
+                return destination
         except Exception:
             pass
         await asyncio.sleep(2 ** attempt)
-    
     raise Exception("Download failed")
 
-def generate_pdf(images: list) -> bytes:
-    """Generate PDF with images filling entire pages"""
-    pdf_buffer = io.BytesIO()
-    c = canvas.Canvas(pdf_buffer)
-    
-    for img_path in images:
+
+def generate_pdf(image_paths: list) -> bytes:
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer)
+    for img_path in image_paths:
         try:
-            with Image.open(img_path) as img:
-                # Get image dimensions
-                img_width, img_height = img.size
-                aspect_ratio = img_width / img_height
-                
-                # Create a full-page canvas with image's aspect ratio
-                page_width = 595  # A4 width in points (8.27 inches)
-                page_height = page_width / aspect_ratio
-                
-                # Set page size based on image dimensions
-                c.setPageSize((page_width, page_height))
-                
-                # Draw image to fill entire page
-                c.drawImage(
-                    str(img_path), 
-                    0, 0, 
-                    width=page_width, 
-                    height=page_height,
-                    preserveAspectRatio=False
-                )
+            with Image.open(img_path) as im:
+                w, h = im.size
+                ratio = w / h
+                page_w = 595
+                page_h = page_w / ratio
+                c.setPageSize((page_w, page_h))
+                c.drawImage(str(img_path), 0, 0, width=page_w, height=page_h)
                 c.showPage()
         except Exception:
-            pass
-    
+            continue
     c.save()
-    return pdf_buffer.getvalue()
+    return buffer.getvalue()
+
+# Custom reply keyboards
+stop_keyboard = ReplyKeyboardMarkup([["/stop"]], resize_keyboard=True, one_time_keyboard=True)
 
 @app.on_message(filters.command("begin"))
 async def start_session(_, message: Message):
-    user_id = message.from_user.id
-    user_dir = TEMP_DIR / str(user_id)
-    
-    if user_dir.exists():
-        shutil.rmtree(user_dir, ignore_errors=True)
+    uid = message.from_user.id
+    user_dir = TEMP_DIR / str(uid)
+    shutil.rmtree(user_dir, ignore_errors=True)
     user_dir.mkdir(parents=True, exist_ok=True)
-    
-    sessions[user_id] = {
-        "images": [],
-        "dir": user_dir,
-        "active": True
-    }
-    
-    await message.reply("📸 Session started! Send images. /stop when done.")
+    sessions[uid] = {"images": [], "dir": user_dir, "active": True}
+    await message.reply(
+        "📸 Session started! Send your images now.",
+        reply_markup=stop_keyboard
+    )
 
 @app.on_message(filters.command("stop"))
 async def stop_session(_, message: Message):
-    user_id = message.from_user.id
-    session = sessions.get(user_id)
-    
-    if not session or not session["active"]:
-        return await message.reply("❌ No active session! Send /begin first.")
-    
+    uid = message.from_user.id
+    session = sessions.get(uid)
+    if not session or not session.get("active"):
+        return await message.reply(
+            "❌ No active session. Use /begin to start.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
     session["active"] = False
-    if not session["images"]:
-        clean_session(user_id)
-        return await message.reply("⚠️ No images received!")
-    
-    progress_msg = await message.reply("⏳ Downloading images...")
+    images = session.get("images", [])
+    if not images:
+        clean_session(uid)
+        return await message.reply(
+            "⚠️ No images received. Session canceled.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    progress = await message.reply(
+        f"⏳ Downloading {len(images)} images...",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
     downloaded = []
-    
-    for idx, msg in enumerate(session["images"]):
+    for idx, img_msg in enumerate(images, 1):
         try:
-            img_path = await download_image(msg, session["dir"])
-            downloaded.append(img_path)
-            if (idx + 1) % 5 == 0:
-                await progress_msg.edit_text(f"⏳ Downloaded {idx+1}/{len(session['images'])} images...")
+            path = await download_image(img_msg, session["dir"])
+            downloaded.append(path)
+            bar = "█" * int(20 * idx / len(images)) + "░" * (20 - int(20 * idx / len(images)))
+            await progress.edit_text(f"⏳ [{bar}] {idx}/{len(images)} images")
         except Exception:
-            await progress_msg.reply(f"❌ Failed image {idx+1}. Skipping...")
-    
+            await progress.reply(f"❌ Failed to download image {idx}, skipping.")
+
     if not downloaded:
-        clean_session(user_id)
-        return await progress_msg.edit_text("❌ All downloads failed! Session aborted.")
-    
-    await progress_msg.edit_text("✅ Download complete! Send PDF filename:")
-    session["downloaded"] = downloaded
-    session["waiting"] = True
+        clean_session(uid)
+        return await progress.edit_text("❌ All downloads failed. Session aborted.")
+
+    session.update({"downloaded": downloaded, "waiting": True})
+    await progress.edit_text(
+        "✅ Download complete! Please reply with the filename for your PDF (without extension):",
+        reply_markup=ForceReply(selective=True)
+    )
 
 @app.on_message(filters.private & filters.text)
 async def handle_filename(client: Client, message: Message):
-    user_id = message.from_user.id
-    session = sessions.get(user_id)
-    
+    uid = message.from_user.id
+    session = sessions.get(uid)
     if not session or not session.get("waiting"):
         return
-    
-    filename = re.sub(r'[^\w\-_\. ]', '_', message.text.strip()[:50])
-    if not filename:
-        filename = "document"
-    
-    tmp_path = None
+    session["waiting"] = False
+
+    # Sanitize and limit filename
+    base = re.sub(r"[^\w\-_. ]", "_", message.text.strip())[:50] or "document"
     try:
-        pdf_data = generate_pdf(session["downloaded"])
-        
+        pdf = generate_pdf(session["downloaded"])
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(pdf_data)
-            tmp_path = tmp.name
-        
+            tmp.write(pdf)
+            tmp_file = tmp.name
         await client.send_document(
-            chat_id=user_id,
-            document=tmp_path,
-            file_name=f"{filename}.pdf",
-            caption=f"✅ PDF Generated • {len(session['downloaded'])} pages"
+            message.chat.id,
+            document=tmp_file,
+            file_name=f"{base}.pdf",
+            caption=f"✅ PDF created: {len(session['downloaded'])} pages"
         )
     except Exception:
-        await message.reply("❌ PDF creation failed")
+        await message.reply("❌ Failed to create PDF.")
     finally:
-        clean_session(user_id)
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        clean_session(uid)
+        try:
+            os.unlink(tmp_file)
+        except:
+            pass
 
 @app.on_message(filters.private & (filters.photo | filters.document))
 async def handle_image(_, message: Message):
-    user_id = message.from_user.id
-    session = sessions.get(user_id)
-    
-    if not session or not session["active"]:
-        return
-    
-    if is_image(message):
+    uid = message.from_user.id
+    session = sessions.get(uid)
+    if session and session.get("active") and is_image(message):
         session["images"].append(message)
 
+
 def clean_session(user_id):
-    if user_id in sessions:
-        session = sessions.pop(user_id)
-        user_dir = session.get("dir")
-        if user_dir and user_dir.exists():
-            try:
-                shutil.rmtree(user_dir, ignore_errors=True)
-            except Exception:
-                pass
+    sess = sessions.pop(user_id, None)
+    if sess:
+        shutil.rmtree(sess.get("dir", Path()), ignore_errors=True)
+
 
 def run_bot():
     while True:
