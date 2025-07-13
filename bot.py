@@ -33,7 +33,7 @@ sessions = {}
 # Flask server setup
 flask_app = Flask(__name__)
 
-@flask_app.route('/')
+@flask_app.route('/health')
 def health_check():
     return Response("OK", status=200)
 
